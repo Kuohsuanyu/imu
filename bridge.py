@@ -150,21 +150,25 @@ async def run_bridge(target_name: str):
 
         print(f"掃描中，尋找 '{target_name}' ...")
 
-        async with bleak.BleakScanner(detection_callback=on_discovered):
-            try:
-                await asyncio.wait_for(found_event.wait(), timeout=15.0)
-            except asyncio.TimeoutError:
-                print(f"[ERROR] 找不到裝置 '{target_name}'，用 --scan 確認名稱")
-                return
+        # 用 start/stop 取代 async with，這樣停止 scanner 後
+        # BlueZ 的裝置記錄仍保留（不被 context exit 觸發清除），
+        # 同時避免 scanner 繼續佔用 BLE adapter 干擾連線
+        scanner = bleak.BleakScanner(detection_callback=on_discovered)
+        await scanner.start()
+        try:
+            await asyncio.wait_for(found_event.wait(), timeout=15.0)
+        except asyncio.TimeoutError:
+            await scanner.stop()
+            print(f"[ERROR] 找不到裝置 '{target_name}'，用 --scan 確認名稱")
+            return
 
-            print(f"找到：{found_device.name}  ({found_device.address})")
-            # 在 scanner 仍開啟時稍等，讓 BlueZ 完成內部登記
-            await asyncio.sleep(0.5)
+        print(f"找到：{found_device.name}  ({found_device.address})")
+        await scanner.stop()          # 停止掃描，釋放 adapter 供連線使用
+        await asyncio.sleep(2.0)      # 等待 BlueZ 完成 StopDiscovery 處理
 
-            print("連線中...")
-            async with bleak.BleakClient(found_device, timeout=30.0) as client:
-                # scanner context 在 BleakClient 連上後就可以結束了
-                print(f"已連線！MTU={client.mtu_size}")
+        print("連線中...")
+        async with bleak.BleakClient(found_device, timeout=30.0) as client:
+            print(f"已連線！MTU={client.mtu_size}")
 
                 notify_char = write_char = None
                 for svc in client.services:
