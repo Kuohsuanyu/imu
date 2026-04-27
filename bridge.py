@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
 """
-BWT901BLE5.0 → Hiwonder 協定橋接器
-BLE 資料 → 虛擬串口 /dev/ttyUSB0（透過內建 socat）
+BWT901BLE5.0 → Hiwonder 協定橋接器（tty0tty 版本）
 
-與原始 firmware 架構完全相容：
-  firmware (faux-rtos) 讀 /dev/ttyUSB0
-  本腳本寫 /dev/ttyVirtual0
-  socat 自動橋接兩端
+firmware (faux-rtos) 讀 /dev/ttyUSB0
+本腳本寫 /dev/tnt0（透過 tty0tty 核心模組橋接）
+
+安裝 tty0tty：
+  sudo insmod tty0tty.ko        # 建立 /dev/tnt0–tnt7
+  sudo ln -sf /dev/tnt1 /dev/ttyUSB0
 
 使用方式：
   sudo python3 bridge.py                     # 自動搜尋 WT901BLE67
   sudo python3 bridge.py --name MyDevice     # 指定裝置名稱
   sudo python3 bridge.py --scan              # 掃描附近 BLE 裝置後退出
-
-依賴：
-  sudo apt install socat
-  pip install bleak pyserial --break-system-packages
 """
 
 import argparse
 import asyncio
-import os
 import struct
-import subprocess
 import sys
 import time
 
@@ -30,13 +25,12 @@ import serial
 import bleak
 
 # ── 設定 ──────────────────────────────────────────────────────────────────────
-DEFAULT_NAME  = "WT901BLE67"
-NOTIFY_UUID   = "0000ffe4-0000-1000-8000-00805f9a34fb"
-WRITE_UUID    = "0000ffe9-0000-1000-8000-00805f9a34fb"
+DEFAULT_NAME   = "WT901BLE67"
+NOTIFY_UUID    = "0000ffe4-0000-1000-8000-00805f9a34fb"
+WRITE_UUID     = "0000ffe9-0000-1000-8000-00805f9a34fb"
 
-FIRMWARE_PORT = "/dev/ttyUSB0"      # firmware 讀這端
-BRIDGE_PORT   = "/dev/ttyVirtual0"  # 本腳本寫這端
-BAUD_RATE     = 230400
+VIRTUAL_PORT   = "/dev/tnt0"   # 本腳本寫這端；/dev/tnt1 ↔ /dev/ttyUSB0
+BAUD_RATE      = 230400
 
 OUTPUT_RATE_HZ = 50
 _RATE_MAP = {10: 6, 20: 7, 50: 8, 100: 9, 200: 11}
@@ -50,7 +44,6 @@ def clamp_i16(v: float) -> int:
     return max(-32768, min(32767, int(round(v))))
 
 def make_packet(ptype: int, v0: float, v1: float, v2: float, v3: float = 0.0) -> bytes:
-    """組成 11-byte Hiwonder 封包，checksum = sum(前10bytes) & 0xFF"""
     body = bytes([0x55, ptype]) + struct.pack('<hhhh',
         clamp_i16(v0), clamp_i16(v1), clamp_i16(v2), clamp_i16(v3))
     return body + bytes([sum(body) & 0xFF])
@@ -64,7 +57,7 @@ def serial_write(data: bytes):
     if _ser and _ser.is_open:
         try:
             _ser.write(data)
-            _ser.flush()          # 確保立即送出，不留在緩衝區
+            _ser.flush()
         except Exception as e:
             print(f"[WARN] 串口寫入失敗: {e}")
 
@@ -89,13 +82,13 @@ def _convert_and_forward(b: list):
     ptype = b[1]
 
     if ptype == 0x61:
-        ax = sign16(b[3]  << 8 | b[2])  / 32768 * 16     # g
+        ax = sign16(b[3]  << 8 | b[2])  / 32768 * 16
         ay = sign16(b[5]  << 8 | b[4])  / 32768 * 16
         az = sign16(b[7]  << 8 | b[6])  / 32768 * 16
-        gx = sign16(b[9]  << 8 | b[8])  / 32768 * 2000   # dps
+        gx = sign16(b[9]  << 8 | b[8])  / 32768 * 2000
         gy = sign16(b[11] << 8 | b[10]) / 32768 * 2000
         gz = sign16(b[13] << 8 | b[12]) / 32768 * 2000
-        ang_x = sign16(b[15] << 8 | b[14]) / 32768 * 180 # deg
+        ang_x = sign16(b[15] << 8 | b[14]) / 32768 * 180
         ang_y = sign16(b[17] << 8 | b[16]) / 32768 * 180
         ang_z = sign16(b[19] << 8 | b[18]) / 32768 * 180
 
@@ -118,36 +111,6 @@ def _convert_and_forward(b: list):
         serial_write(pkt_quat)
 
 
-# ── socat 管理 ────────────────────────────────────────────────────────────────
-def start_socat() -> subprocess.Popen:
-    for p in (FIRMWARE_PORT, BRIDGE_PORT):
-        if os.path.islink(p) or os.path.exists(p):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
-
-    proc = subprocess.Popen(
-        ["socat",
-         f"PTY,link={FIRMWARE_PORT},raw,echo=0",
-         f"PTY,link={BRIDGE_PORT},raw,echo=0"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    for _ in range(20):
-        if os.path.exists(FIRMWARE_PORT) and os.path.exists(BRIDGE_PORT):
-            break
-        time.sleep(0.1)
-    else:
-        proc.terminate()
-        print("[ERROR] socat 無法建立虛擬串口，請確認已安裝: sudo apt install socat")
-        sys.exit(1)
-
-    print(f"虛擬串口已建立：{BRIDGE_PORT} ↔ {FIRMWARE_PORT}")
-    return proc
-
-
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 def make_read_cmd(reg: int) -> bytes:
     return bytes([0xff, 0xaa, 0x27, reg, 0x00])
@@ -163,22 +126,19 @@ async def scan_devices():
 async def run_bridge(target_name: str):
     global _ser
 
-    socat_proc = start_socat()
-
-    # raw 模式開啟串口，關閉所有流量控制
+    # 開啟 tty0tty 虛擬串口
     _ser = serial.Serial(
-        BRIDGE_PORT,
+        VIRTUAL_PORT,
         baudrate=BAUD_RATE,
         timeout=0,
         xonxoff=False,
         rtscts=False,
         dsrdtr=False,
     )
-    print(f"串口已開啟: {BRIDGE_PORT} @ {BAUD_RATE} baud")
+    print(f"串口已開啟: {VIRTUAL_PORT} @ {BAUD_RATE} baud")
 
     try:
-        # 用名稱搜尋裝置（避免 BLE 隨機 MAC 問題）
-        print(f"掃描中，尋找 '{target_name}' ...")
+        # ── 掃描並連線（在 scanner context 內連線，避免 BlueZ 刪除裝置物件）──
         found_event = asyncio.Event()
         found_device = None
 
@@ -188,87 +148,90 @@ async def run_bridge(target_name: str):
                 found_device = device
                 found_event.set()
 
+        print(f"掃描中，尋找 '{target_name}' ...")
+
         async with bleak.BleakScanner(detection_callback=on_discovered):
-            await asyncio.wait_for(found_event.wait(), timeout=15.0)
-
-        if found_device is None:
-            print(f"[ERROR] 找不到裝置 '{target_name}'，用 --scan 確認名稱")
-            return
-
-        print(f"找到：{found_device.name}  ({found_device.address})")
-        print(f"連線中...")
-
-        async with bleak.BleakClient(found_device, timeout=30.0) as client:
-            print(f"已連線！MTU={client.mtu_size}\n")
-
-            notify_char = write_char = None
-            for svc in client.services:
-                for ch in svc.characteristics:
-                    if ch.uuid == NOTIFY_UUID:
-                        notify_char = ch
-                    if ch.uuid == WRITE_UUID:
-                        write_char = ch
-
-            if notify_char is None:
-                print("[ERROR] 找不到 notify characteristic")
+            try:
+                await asyncio.wait_for(found_event.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                print(f"[ERROR] 找不到裝置 '{target_name}'，用 --scan 確認名稱")
                 return
 
-            # 設定輸出頻率
-            rate_val = _RATE_MAP.get(OUTPUT_RATE_HZ, 8)
-            if write_char:
-                await client.write_gatt_char(
-                    write_char.uuid,
-                    bytes([0xff, 0xaa, 0x03, rate_val, 0x00])
-                )
-                await asyncio.sleep(0.1)
-                print(f"輸出率設定：{OUTPUT_RATE_HZ} Hz")
+            print(f"找到：{found_device.name}  ({found_device.address})")
+            # 在 scanner 仍開啟時稍等，讓 BlueZ 完成內部登記
+            await asyncio.sleep(0.5)
 
-            await client.start_notify(notify_char.uuid, on_notify)
-            print("橋接中（按 Ctrl+C 停止）...\n")
+            print("連線中...")
+            async with bleak.BleakClient(found_device, timeout=30.0) as client:
+                # scanner context 在 BleakClient 連上後就可以結束了
+                print(f"已連線！MTU={client.mtu_size}")
 
-            async def quat_request_loop():
-                """50Hz 請求四元數"""
-                while True:
-                    if write_char:
-                        try:
-                            await client.write_gatt_char(
-                                write_char.uuid, make_read_cmd(0x51))
-                        except Exception:
-                            pass
-                    await asyncio.sleep(1.0 / OUTPUT_RATE_HZ)
+                notify_char = write_char = None
+                for svc in client.services:
+                    for ch in svc.characteristics:
+                        if ch.uuid == NOTIFY_UUID:
+                            notify_char = ch
+                        if ch.uuid == WRITE_UUID:
+                            write_char = ch
 
-            async def drain_serial_loop():
-                """讀取並丟棄 firmware 送來的設定指令，防止 PTY 緩衝區滿"""
-                while True:
-                    if _ser and _ser.is_open:
-                        try:
-                            waiting = _ser.in_waiting
-                            if waiting > 0:
-                                _ser.read(waiting)
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.05)
+                if notify_char is None:
+                    print("[ERROR] 找不到 notify characteristic")
+                    return
 
-            try:
-                await asyncio.gather(
-                    quat_request_loop(),
-                    drain_serial_loop(),
-                    asyncio.sleep(86400),
-                )
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                pass
+                # 設定輸出頻率
+                rate_val = _RATE_MAP.get(OUTPUT_RATE_HZ, 8)
+                if write_char:
+                    await client.write_gatt_char(
+                        write_char.uuid,
+                        bytes([0xff, 0xaa, 0x03, rate_val, 0x00])
+                    )
+                    await asyncio.sleep(0.1)
+                    print(f"輸出率設定：{OUTPUT_RATE_HZ} Hz")
 
-            await client.stop_notify(notify_char.uuid)
+                await client.start_notify(notify_char.uuid, on_notify)
+                print("橋接中（按 Ctrl+C 停止）...\n")
+
+                async def quat_request_loop():
+                    while True:
+                        if write_char:
+                            try:
+                                await client.write_gatt_char(
+                                    write_char.uuid, make_read_cmd(0x51))
+                            except Exception:
+                                pass
+                        await asyncio.sleep(1.0 / OUTPUT_RATE_HZ)
+
+                async def drain_serial_loop():
+                    """讀取並丟棄 firmware 送來的設定指令，防止 PTY 緩衝區滿"""
+                    while True:
+                        if _ser and _ser.is_open:
+                            try:
+                                waiting = _ser.in_waiting
+                                if waiting > 0:
+                                    _ser.read(waiting)
+                            except Exception:
+                                pass
+                        await asyncio.sleep(0.05)
+
+                try:
+                    await asyncio.gather(
+                        quat_request_loop(),
+                        drain_serial_loop(),
+                        asyncio.sleep(86400),
+                    )
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    pass
+
+                await client.stop_notify(notify_char.uuid)
 
     finally:
         if _ser and _ser.is_open:
             _ser.close()
-        socat_proc.terminate()
-        print("\n橋接結束，虛擬串口已移除")
+        print("\n橋接結束")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BWT901BLE5.0 → Hiwonder 橋接器")
+    parser = argparse.ArgumentParser(description="BWT901BLE5.0 → Hiwonder 橋接器（tty0tty）")
     parser.add_argument("--name", default=DEFAULT_NAME,
                         help=f"BLE 裝置名稱（預設: {DEFAULT_NAME}）")
     parser.add_argument("--scan", action="store_true",
@@ -278,10 +241,6 @@ def main():
     if args.scan:
         asyncio.run(scan_devices())
         return
-
-    if os.geteuid() != 0:
-        print("[ERROR] 需要 sudo 權限（建立虛擬串口需要 root）")
-        sys.exit(1)
 
     asyncio.run(run_bridge(args.name))
 
