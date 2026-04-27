@@ -10,16 +10,15 @@ firmware (faux-rtos) 讀 /dev/ttyUSB0
   sudo ln -sf /dev/tnt1 /dev/ttyUSB0
 
 使用方式：
-  sudo python3 bridge.py                     # 自動搜尋 WT901BLE67
-  sudo python3 bridge.py --name MyDevice     # 指定裝置名稱
-  sudo python3 bridge.py --scan              # 掃描附近 BLE 裝置後退出
+  python3 bridge.py                     # 自動搜尋 WT901BLE67
+  python3 bridge.py --name MyDevice     # 指定裝置名稱
+  python3 bridge.py --scan              # 掃描附近 BLE 裝置後退出
 """
 
 import argparse
 import asyncio
 import struct
 import sys
-import time
 
 import serial
 import bleak
@@ -111,10 +110,72 @@ def _convert_and_forward(b: list):
         serial_write(pkt_quat)
 
 
-# ── 主流程 ────────────────────────────────────────────────────────────────────
-def make_read_cmd(reg: int) -> bytes:
-    return bytes([0xff, 0xaa, 0x27, reg, 0x00])
+# ── GATT 工作階段 ──────────────────────────────────────────────────────────────
+async def _gatt_session(client: bleak.BleakClient):
+    notify_char = write_char = None
+    for svc in client.services:
+        for ch in svc.characteristics:
+            if ch.uuid == NOTIFY_UUID:
+                notify_char = ch
+            if ch.uuid == WRITE_UUID:
+                write_char = ch
 
+    if notify_char is None:
+        print("[ERROR] 找不到 notify characteristic")
+        return
+
+    rate_val = _RATE_MAP.get(OUTPUT_RATE_HZ, 8)
+    if write_char:
+        await client.write_gatt_char(
+            write_char.uuid,
+            bytes([0xff, 0xaa, 0x03, rate_val, 0x00])
+        )
+        await asyncio.sleep(0.1)
+        print(f"輸出率設定：{OUTPUT_RATE_HZ} Hz")
+
+    await client.start_notify(notify_char.uuid, on_notify)
+    print("橋接中（按 Ctrl+C 停止）...\n")
+
+    def make_read_cmd(reg: int) -> bytes:
+        return bytes([0xff, 0xaa, 0x27, reg, 0x00])
+
+    async def quat_request_loop():
+        while True:
+            if write_char:
+                try:
+                    await client.write_gatt_char(
+                        write_char.uuid, make_read_cmd(0x51))
+                except Exception:
+                    pass
+            await asyncio.sleep(1.0 / OUTPUT_RATE_HZ)
+
+    async def drain_serial_loop():
+        while True:
+            if _ser and _ser.is_open:
+                try:
+                    waiting = _ser.in_waiting
+                    if waiting > 0:
+                        _ser.read(waiting)
+                except Exception:
+                    pass
+            await asyncio.sleep(0.05)
+
+    try:
+        await asyncio.gather(
+            quat_request_loop(),
+            drain_serial_loop(),
+            asyncio.sleep(86400),
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        try:
+            await client.stop_notify(notify_char.uuid)
+        except Exception:
+            pass
+
+
+# ── 主流程 ────────────────────────────────────────────────────────────────────
 async def scan_devices():
     print("掃描 BLE 裝置（5 秒）...")
     devices = await bleak.BleakScanner.discover(timeout=5)
@@ -123,10 +184,10 @@ async def scan_devices():
     for d in devices:
         print(f"  {d.address}  {d.name}")
 
+
 async def run_bridge(target_name: str):
     global _ser
 
-    # 開啟 tty0tty 虛擬串口
     _ser = serial.Serial(
         VIRTUAL_PORT,
         baudrate=BAUD_RATE,
@@ -138,96 +199,52 @@ async def run_bridge(target_name: str):
     print(f"串口已開啟: {VIRTUAL_PORT} @ {BAUD_RATE} baud")
 
     try:
-        # ── 掃描並連線（在 scanner context 內連線，避免 BlueZ 刪除裝置物件）──
-        found_event = asyncio.Event()
-        found_device = None
+        while True:
+            # ── 掃描裝置（find_device_by_name 自己管好 scanner lifecycle）──
+            print(f"掃描中，尋找 '{target_name}' ...")
+            device = await bleak.BleakScanner.find_device_by_name(
+                target_name, timeout=15.0)
 
-        def on_discovered(device, _):
-            nonlocal found_device
-            if device.name == target_name and not found_event.is_set():
-                found_device = device
-                found_event.set()
+            if device is None:
+                print(f"[WARN] 找不到 '{target_name}'，5 秒後重試...")
+                await asyncio.sleep(5.0)
+                continue
 
-        print(f"掃描中，尋找 '{target_name}' ...")
+            print(f"找到：{device.name}  ({device.address})")
+            # 用 address 字串（不是 device 物件），讓 BlueZ 從 cache 重建 D-Bus 路徑
+            address = device.address
+            await asyncio.sleep(1.0)
 
-        # 用 start/stop 取代 async with，這樣停止 scanner 後
-        # BlueZ 的裝置記錄仍保留（不被 context exit 觸發清除），
-        # 同時避免 scanner 繼續佔用 BLE adapter 干擾連線
-        scanner = bleak.BleakScanner(detection_callback=on_discovered)
-        await scanner.start()
-        try:
-            await asyncio.wait_for(found_event.wait(), timeout=15.0)
-        except asyncio.TimeoutError:
-            await scanner.stop()
-            print(f"[ERROR] 找不到裝置 '{target_name}'，用 --scan 確認名稱")
-            return
+            # ── 連線（帶重試）──────────────────────────────────────────────
+            connected = False
+            for attempt in range(5):
+                print(f"連線中... (嘗試 {attempt + 1}/5)")
+                try:
+                    async with bleak.BleakClient(address, timeout=30.0) as client:
+                        print(f"已連線！MTU={client.mtu_size}")
+                        connected = True
+                        await _gatt_session(client)
+                    break  # 正常結束（KeyboardInterrupt 從 _gatt_session 傳出）
 
-        print(f"找到：{found_device.name}  ({found_device.address})")
-        await scanner.stop()          # 停止掃描，釋放 adapter 供連線使用
-        await asyncio.sleep(2.0)      # 等待 BlueZ 完成 StopDiscovery 處理
+                except (KeyboardInterrupt, SystemExit):
+                    raise
 
-        print("連線中...")
-        async with bleak.BleakClient(found_device, timeout=30.0) as client:
-            print(f"已連線！MTU={client.mtu_size}")
+                except BaseException as e:
+                    # 包含 CancelledError、TimeoutError、BleakError 等
+                    print(f"連線失敗: {type(e).__name__}: {e}")
+                    if attempt < 4:
+                        print(f"  {3} 秒後重試...")
+                        await asyncio.sleep(3.0)
 
-            notify_char = write_char = None
-            for svc in client.services:
-                for ch in svc.characteristics:
-                    if ch.uuid == NOTIFY_UUID:
-                        notify_char = ch
-                    if ch.uuid == WRITE_UUID:
-                        write_char = ch
+            if not connected:
+                print("5 次連線均失敗，重新掃描...")
+                await asyncio.sleep(2.0)
+                # 繼續外層 while 重新掃描
+            else:
+                break  # 正常結束
 
-            if notify_char is None:
-                print("[ERROR] 找不到 notify characteristic")
-                return
-
-            # 設定輸出頻率
-            rate_val = _RATE_MAP.get(OUTPUT_RATE_HZ, 8)
-            if write_char:
-                await client.write_gatt_char(
-                    write_char.uuid,
-                    bytes([0xff, 0xaa, 0x03, rate_val, 0x00])
-                )
-                await asyncio.sleep(0.1)
-                print(f"輸出率設定：{OUTPUT_RATE_HZ} Hz")
-
-            await client.start_notify(notify_char.uuid, on_notify)
-            print("橋接中（按 Ctrl+C 停止）...\n")
-
-            async def quat_request_loop():
-                while True:
-                    if write_char:
-                        try:
-                            await client.write_gatt_char(
-                                write_char.uuid, make_read_cmd(0x51))
-                        except Exception:
-                            pass
-                    await asyncio.sleep(1.0 / OUTPUT_RATE_HZ)
-
-            async def drain_serial_loop():
-                """讀取並丟棄 firmware 送來的設定指令，防止 PTY 緩衝區滿"""
-                while True:
-                    if _ser and _ser.is_open:
-                        try:
-                            waiting = _ser.in_waiting
-                            if waiting > 0:
-                                _ser.read(waiting)
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.05)
-
-            try:
-                await asyncio.gather(
-                    quat_request_loop(),
-                    drain_serial_loop(),
-                    asyncio.sleep(86400),
-                )
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                pass
-
-            await client.stop_notify(notify_char.uuid)
-
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
     finally:
         if _ser and _ser.is_open:
             _ser.close()
