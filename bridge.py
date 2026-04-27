@@ -170,63 +170,63 @@ async def run_bridge(target_name: str):
         async with bleak.BleakClient(found_device, timeout=30.0) as client:
             print(f"已連線！MTU={client.mtu_size}")
 
-                notify_char = write_char = None
-                for svc in client.services:
-                    for ch in svc.characteristics:
-                        if ch.uuid == NOTIFY_UUID:
-                            notify_char = ch
-                        if ch.uuid == WRITE_UUID:
-                            write_char = ch
+            notify_char = write_char = None
+            for svc in client.services:
+                for ch in svc.characteristics:
+                    if ch.uuid == NOTIFY_UUID:
+                        notify_char = ch
+                    if ch.uuid == WRITE_UUID:
+                        write_char = ch
 
-                if notify_char is None:
-                    print("[ERROR] 找不到 notify characteristic")
-                    return
+            if notify_char is None:
+                print("[ERROR] 找不到 notify characteristic")
+                return
 
-                # 設定輸出頻率
-                rate_val = _RATE_MAP.get(OUTPUT_RATE_HZ, 8)
-                if write_char:
-                    await client.write_gatt_char(
-                        write_char.uuid,
-                        bytes([0xff, 0xaa, 0x03, rate_val, 0x00])
-                    )
-                    await asyncio.sleep(0.1)
-                    print(f"輸出率設定：{OUTPUT_RATE_HZ} Hz")
+            # 設定輸出頻率
+            rate_val = _RATE_MAP.get(OUTPUT_RATE_HZ, 8)
+            if write_char:
+                await client.write_gatt_char(
+                    write_char.uuid,
+                    bytes([0xff, 0xaa, 0x03, rate_val, 0x00])
+                )
+                await asyncio.sleep(0.1)
+                print(f"輸出率設定：{OUTPUT_RATE_HZ} Hz")
 
-                await client.start_notify(notify_char.uuid, on_notify)
-                print("橋接中（按 Ctrl+C 停止）...\n")
+            await client.start_notify(notify_char.uuid, on_notify)
+            print("橋接中（按 Ctrl+C 停止）...\n")
 
-                async def quat_request_loop():
-                    while True:
-                        if write_char:
-                            try:
-                                await client.write_gatt_char(
-                                    write_char.uuid, make_read_cmd(0x51))
-                            except Exception:
-                                pass
-                        await asyncio.sleep(1.0 / OUTPUT_RATE_HZ)
+            async def quat_request_loop():
+                while True:
+                    if write_char:
+                        try:
+                            await client.write_gatt_char(
+                                write_char.uuid, make_read_cmd(0x51))
+                        except Exception:
+                            pass
+                    await asyncio.sleep(1.0 / OUTPUT_RATE_HZ)
 
-                async def drain_serial_loop():
-                    """讀取並丟棄 firmware 送來的設定指令，防止 PTY 緩衝區滿"""
-                    while True:
-                        if _ser and _ser.is_open:
-                            try:
-                                waiting = _ser.in_waiting
-                                if waiting > 0:
-                                    _ser.read(waiting)
-                            except Exception:
-                                pass
-                        await asyncio.sleep(0.05)
+            async def drain_serial_loop():
+                """讀取並丟棄 firmware 送來的設定指令，防止 PTY 緩衝區滿"""
+                while True:
+                    if _ser and _ser.is_open:
+                        try:
+                            waiting = _ser.in_waiting
+                            if waiting > 0:
+                                _ser.read(waiting)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.05)
 
-                try:
-                    await asyncio.gather(
-                        quat_request_loop(),
-                        drain_serial_loop(),
-                        asyncio.sleep(86400),
-                    )
-                except (KeyboardInterrupt, asyncio.CancelledError):
-                    pass
+            try:
+                await asyncio.gather(
+                    quat_request_loop(),
+                    drain_serial_loop(),
+                    asyncio.sleep(86400),
+                )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                pass
 
-                await client.stop_notify(notify_char.uuid)
+            await client.stop_notify(notify_char.uuid)
 
     finally:
         if _ser and _ser.is_open:
