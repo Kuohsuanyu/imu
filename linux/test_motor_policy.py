@@ -34,6 +34,9 @@ import time
 import numpy as np
 import onnxruntime as ort
 
+# 真實 IMU 支援（--imu 旗標啟用）
+_bridge = None   # 延遲 import，避免沒有 bleak 時報錯
+
 # ── 策略關節順序（20-dim）────────────────────────────────────────────────────
 POLICY_JOINT_NAMES = [
     "dof_right_shoulder_pitch_03", "dof_right_shoulder_roll_03",
@@ -91,19 +94,31 @@ def load_kinfer(path: str):
     return init_sess, step_sess, metadata
 
 def build_policy_feed(step_sess, joint_pos, joint_vel, carry, num_commands, sim_t):
-    """假 IMU：機器人直立靜止"""
+    """IMU 資料 → policy 輸入。有真實 IMU 時讀 bridge.IMU_STATE，否則用假值。"""
     names = {i.name for i in step_sess.get_inputs()}
     feed = {
         "joint_angles":             joint_pos.astype(np.float32),
         "joint_angular_velocities": joint_vel.astype(np.float32),
         "carry":                    carry,
     }
+
+    if _bridge is not None:
+        with _bridge._imu_lock:
+            acc  = _bridge.IMU_STATE["acc"].copy()
+            gyro = _bridge.IMU_STATE["gyro"].copy()
+            quat = _bridge.IMU_STATE["quat"].copy()
+        proj_grav = _bridge.proj_gravity_from_quat(*quat)
+    else:
+        acc       = np.array([0.0, 0.0, -9.81], dtype=np.float32)
+        gyro      = np.zeros(3, dtype=np.float32)
+        proj_grav = np.array([0.0, 0.0, -1.0],  dtype=np.float32)
+
     if "projected_gravity" in names:
-        feed["projected_gravity"] = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        feed["projected_gravity"] = proj_grav
     if "gyroscope" in names:
-        feed["gyroscope"] = np.zeros(3, dtype=np.float32)
+        feed["gyroscope"] = gyro
     if "accelerometer" in names:
-        feed["accelerometer"] = np.array([0.0, 0.0, -9.81], dtype=np.float32)
+        feed["accelerometer"] = acc
     if "time" in names:
         feed["time"] = np.array([sim_t], dtype=np.float32)
     if "command" in names:
@@ -342,22 +357,24 @@ def run_sine(args, motor_ids: list, driver):
 
 # ── 主程式 ────────────────────────────────────────────────────────────────────
 def main():
+    global _bridge
+
     default_policy = "/home/andykuo/ksim-gym/kbot_robot/Policies/kbot_zero_position.kinfer"
 
     parser = argparse.ArgumentParser(
-        description="馬達測試腳本（假 IMU）",
+        description="馬達測試腳本（支援真實 IMU）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 模式說明：
   zero    — 所有馬達歸零位（組裝確認、上電安全測試）
-  policy  — 載入 .kinfer 模型推論，假 IMU（直立靜止）
+  policy  — 載入 .kinfer 模型推論（預設假 IMU，--imu 啟用真實）
   sine    — 正弦波運動測試（不需要 policy）
 
 範例：
   python test_motor_policy.py --mode zero   --dry_run
   python test_motor_policy.py --mode policy --dry_run --ids 31,32,33,34,35
-  python test_motor_policy.py --mode sine   --can can0 --ids 31,32
-  python test_motor_policy.py --mode policy --can can0 --ids 31,32,33,34,35,41,42,43,44,45
+  python test_motor_policy.py --mode policy --imu --dry_run          # 真實 IMU + 假馬達
+  python test_motor_policy.py --mode policy --imu --can can0 --ids 31,32,33,34,35,41,42,43,44,45
         """,
     )
     parser.add_argument("--mode", default="policy",
@@ -371,7 +388,32 @@ def main():
                         help="馬達 CAN ID，逗號分隔（預設: 31,32,33,34,35）")
     parser.add_argument("--dry_run", action="store_true",
                         help="不接馬達，只印推論結果")
+    parser.add_argument("--imu", action="store_true",
+                        help="啟用真實 IMU（WT901BLE67 via BLE）")
+    parser.add_argument("--imu-name", default="WT901BLE67",
+                        help="BLE 裝置名稱（預設: WT901BLE67）")
     args = parser.parse_args()
+
+    # 啟動 BLE IMU（背景 thread）
+    if args.imu:
+        import importlib.util, pathlib
+        spec = importlib.util.spec_from_file_location(
+            "bridge",
+            pathlib.Path(__file__).parent / "bridge.py"
+        )
+        _bridge = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_bridge)
+        print(f"[IMU] 啟動 BLE bridge，搜尋 '{args.imu_name}'...")
+        _bridge.start_ble_thread(target_name=args.imu_name, use_serial=False)
+        print("[IMU] 等待第一筆 IMU 資料（最多 20 秒）...")
+        for _ in range(200):
+            time.sleep(0.1)
+            with _bridge._imu_lock:
+                if _bridge.IMU_STATE["updated"]:
+                    break
+        else:
+            print("[WARN] 未收到 IMU 資料，使用假值繼續")
+        print("[IMU] 就緒")
 
     # 解析馬達 ID
     motor_ids = [int(x) for x in args.ids.split(",")]

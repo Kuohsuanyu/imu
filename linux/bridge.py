@@ -17,9 +17,12 @@ firmware (faux-rtos) 讀 /dev/ttyUSB0
 
 import argparse
 import asyncio
+import math
 import struct
 import sys
+import threading
 
+import numpy as np
 import serial
 import bleak
 
@@ -33,6 +36,32 @@ BAUD_RATE      = 230400
 
 OUTPUT_RATE_HZ = 50
 _RATE_MAP = {10: 6, 20: 7, 50: 8, 100: 9, 200: 11}
+
+# ── 共享 IMU 狀態（policy 讀這裡，BLE 寫這裡）────────────────────────────────
+IMU_STATE = {
+    "acc":  np.array([0.0, 0.0, 9.81], dtype=np.float32),   # m/s²，包含重力
+    "gyro": np.zeros(3, dtype=np.float32),                   # rad/s
+    "quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),  # [qw,qx,qy,qz]
+    "updated": False,
+}
+_imu_lock = threading.Lock()
+
+
+def proj_gravity_from_quat(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
+    """計算重力在機身座標系的方向（單位向量）。直立靜止時 ≈ [0,0,-1]。"""
+    R02 = 2 * (qx * qz + qy * qw)
+    R12 = 2 * (qy * qz - qx * qw)
+    R22 = 1 - 2 * (qx * qx + qy * qy)
+    return np.array([-R02, -R12, -R22], dtype=np.float32)
+
+
+def start_ble_thread(target_name: str = DEFAULT_NAME, use_serial: bool = False) -> threading.Thread:
+    """在 daemon thread 中啟動 BLE bridge，更新 IMU_STATE。立即返回。"""
+    def _run():
+        asyncio.run(run_bridge(target_name, use_serial=use_serial))
+    t = threading.Thread(target=_run, daemon=True, name="ble-bridge")
+    t.start()
+    return t
 
 
 # ── Hiwonder 封包工具 ─────────────────────────────────────────────────────────
@@ -101,6 +130,12 @@ def _convert_and_forward(b: list):
               f"[ANG] {ang_x:6.1f} {ang_y:6.1f} {ang_z:6.1f}°",
               end="", flush=True)
 
+        # 更新共享狀態（dps → rad/s；g → m/s²）
+        with _imu_lock:
+            IMU_STATE["acc"]  = np.array([ax, ay, az], dtype=np.float32) * 9.81
+            IMU_STATE["gyro"] = np.array([gx, gy, gz], dtype=np.float32) * (math.pi / 180)
+            IMU_STATE["updated"] = True
+
     elif ptype == 0x71 and b[2] == 0x51:
         q0 = sign16(b[5]  << 8 | b[4])  / 32768
         q1 = sign16(b[7]  << 8 | b[6])  / 32768
@@ -108,6 +143,9 @@ def _convert_and_forward(b: list):
         q3 = sign16(b[11] << 8 | b[10]) / 32768
         pkt_quat = make_packet(0x59, q0*32768, q1*32768, q2*32768, q3*32768)
         serial_write(pkt_quat)
+
+        with _imu_lock:
+            IMU_STATE["quat"] = np.array([q0, q1, q2, q3], dtype=np.float32)
 
 
 # ── GATT 工作階段 ──────────────────────────────────────────────────────────────
@@ -185,18 +223,21 @@ async def scan_devices():
         print(f"  {d.address}  {d.name}")
 
 
-async def run_bridge(target_name: str):
+async def run_bridge(target_name: str, use_serial: bool = True):
     global _ser
 
-    _ser = serial.Serial(
-        VIRTUAL_PORT,
-        baudrate=BAUD_RATE,
-        timeout=0,
-        xonxoff=False,
-        rtscts=False,
-        dsrdtr=False,
-    )
-    print(f"串口已開啟: {VIRTUAL_PORT} @ {BAUD_RATE} baud")
+    if use_serial:
+        _ser = serial.Serial(
+            VIRTUAL_PORT,
+            baudrate=BAUD_RATE,
+            timeout=0,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False,
+        )
+        print(f"串口已開啟: {VIRTUAL_PORT} @ {BAUD_RATE} baud")
+    else:
+        print("串口停用（IMU 狀態透過 IMU_STATE 共享）")
 
     try:
         while True:
