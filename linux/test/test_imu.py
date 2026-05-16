@@ -74,11 +74,11 @@ def auto_detect_port() -> str | None:
 
 
 def proj_gravity(qw, qx, qy, qz):
-    """R.T @ [0, 0, -1]，與 inference.rs 相同。"""
+    """重力方向在 body frame（H30 NED 四元數慣例）。"""
     r02 = 2 * (qx * qz - qw * qy)
     r12 = 2 * (qy * qz + qw * qx)
     r22 = qw**2 - qx**2 - qy**2 + qz**2
-    return -r02, -r12, -r22
+    return r02, r12, r22
 
 
 def health_str(val, lo, hi):

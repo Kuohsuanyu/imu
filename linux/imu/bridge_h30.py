@@ -64,14 +64,22 @@ IMU_STATE: dict = {
 }
 
 
+def _ned_to_enu(qw, qx, qy, qz):
+    """H30 NED 四元數 → ENU 四元數（firmware/policy 所需慣例）。
+    NED 平躺 q≈[0,1,0,0] → ENU identity [1,0,0,0]
+    """
+    return float(qx), float(-qw), float(qz), float(-qy)
+
+
 def proj_gravity_from_quat(qw: float, qx: float, qy: float, qz: float):
-    """從四元數計算投影重力向量（與 inference.rs 邏輯一致）。
-    R = 旋轉矩陣，投影重力 = R.T @ [0, 0, -1]（單位向量）
+    """從 H30 NED 四元數計算投影重力向量（body frame）。
+    先轉 ENU 再做 R.T @ [0,0,-1]。
     """
     import numpy as np
-    r02 = 2 * (qx * qz - qw * qy)
-    r12 = 2 * (qy * qz + qw * qx)
-    r22 = qw * qw - qx * qx - qy * qy + qz * qz
+    ew, ex, ey, ez = _ned_to_enu(qw, qx, qy, qz)
+    r02 = 2 * (ex * ez - ew * ey)
+    r12 = 2 * (ey * ez + ew * ex)
+    r22 = ew * ew - ex * ex - ey * ey + ez * ez
     return np.array([-r02, -r12, -r22], dtype=np.float32)
 
 
@@ -203,7 +211,8 @@ def run(imu_port: str, imu_baud: int, virt_port: str, virt_baud: int) -> None:
                     if 'gyro' in result:
                         IMU_STATE['gyro'] = np.array(result['gyro'], dtype=np.float64)
                     if 'quat' in result:
-                        IMU_STATE['quat'] = np.array(result['quat'], dtype=np.float64)
+                        ew, ex, ey, ez = _ned_to_enu(*result['quat'])
+                        IMU_STATE['quat'] = np.array([ew, ex, ey, ez], dtype=np.float64)
                     IMU_STATE['updated'] = True
 
                 # acc: m/s² → Hiwonder int16（量程 ±16g * 9.80665 m/s²）
@@ -222,11 +231,11 @@ def run(imu_port: str, imu_baud: int, virt_port: str, virt_baud: int) -> None:
                         gy / GYRO_FULLSCALE * 32768,
                         gz / GYRO_FULLSCALE * 32768))
 
-                # quat: [qw, qx, qy, qz] → Hiwonder 0x59（int16 × 32768）
+                # quat: H30 NED → ENU → Hiwonder 0x59（int16 × 32768）
                 if 'quat' in result:
-                    qw, qx, qy, qz = result['quat']
+                    ew, ex, ey, ez = _ned_to_enu(*result['quat'])
                     virt_ser.write(_hiwonder_packet(0x59,
-                        qw * 32768, qx * 32768, qy * 32768, qz * 32768))
+                        ew * 32768, ex * 32768, ey * 32768, ez * 32768))
 
                 virt_ser.flush()
                 pos = next_pos
