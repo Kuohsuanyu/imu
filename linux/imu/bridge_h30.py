@@ -51,6 +51,29 @@ GYRO_FULLSCALE = 2000.0 * math.pi / 180.0   # rad/s（±2000 dps）
 DEFAULT_VIRT_PORT = "/dev/tnt0"
 DEFAULT_VIRT_BAUD = 230400
 
+# ── 跨執行緒共享狀態（test_policy.py --imu 讀取用）──────────────────────────
+import threading
+import numpy as np
+
+_imu_lock = threading.Lock()
+IMU_STATE: dict = {
+    "acc":     np.array([0.0, 0.0, -9.81], dtype=np.float64),
+    "gyro":    np.zeros(3, dtype=np.float64),
+    "quat":    np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),  # [qw,qx,qy,qz]
+    "updated": False,
+}
+
+
+def proj_gravity_from_quat(qw: float, qx: float, qy: float, qz: float):
+    """從四元數計算投影重力向量（與 inference.rs 邏輯一致）。
+    R = 旋轉矩陣，投影重力 = R.T @ [0, 0, -1]（單位向量）
+    """
+    import numpy as np
+    r02 = 2 * (qx * qz - qw * qy)
+    r12 = 2 * (qy * qz + qw * qx)
+    r22 = qw * qw - qx * qx - qy * qy + qz * qz
+    return np.array([-r02, -r12, -r22], dtype=np.float32)
+
 
 # ── 工具函數 ──────────────────────────────────────────────────────────────────
 
@@ -172,6 +195,16 @@ def run(imu_port: str, imu_baud: int, virt_port: str, virt_baud: int) -> None:
 
                 last_data.update(result)
                 frame_count += 1
+
+                # 更新共享狀態（供 test_policy.py --imu 讀取）
+                with _imu_lock:
+                    if 'acc' in result:
+                        IMU_STATE['acc'] = np.array(result['acc'], dtype=np.float64)
+                    if 'gyro' in result:
+                        IMU_STATE['gyro'] = np.array(result['gyro'], dtype=np.float64)
+                    if 'quat' in result:
+                        IMU_STATE['quat'] = np.array(result['quat'], dtype=np.float64)
+                    IMU_STATE['updated'] = True
 
                 # acc: m/s² → Hiwonder int16（量程 ±16g * 9.80665 m/s²）
                 if 'acc' in result:
