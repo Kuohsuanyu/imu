@@ -43,7 +43,11 @@ except ImportError:
     sys.exit(1)
 
 # ── 候選串口 ──────────────────────────────────────────────────────────────────
-CANDIDATE_PORTS = ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB1", "/dev/ttyUSB2"]
+CANDIDATE_PORTS = [
+    "/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyACM2", "/dev/ttyACM3",
+    "/dev/ttyACM4", "/dev/ttyACM5", "/dev/ttyACM6", "/dev/ttyACM7",
+    "/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2",
+]
 IMU_BAUD        = 460800
 
 # ── 健康閾值 ──────────────────────────────────────────────────────────────────
