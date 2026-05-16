@@ -271,7 +271,9 @@ def run_policy(args, motor_ids: list, driver, bridge):
 
     imu_info = "真實 H30 IMU" if bridge is not None else "假 IMU（直立靜止）"
     print(f"\n=== Policy 模式 | {imu_info} | {'DRY RUN' if args.dry_run else 'LIVE CAN'} ===")
-    print("Ctrl+C 停止\n")
+    print("Ctrl+C 停止")
+    print("\n  ── 腿部關節安全限制 ──")
+    _print_joint_limits_table()
 
     try:
         while True:
@@ -292,18 +294,25 @@ def run_policy(args, motor_ids: list, driver, bridge):
                              MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
 
             if step_cnt % 50 == 0:
-                print(f"[t={sim_t:6.2f}s]", end="")
+                overload_flags = []
+                print(f"[t={sim_t:6.2f}s]")
                 for mid in motor_ids:
-                    idx    = motor_id_to_policy_idx(mid)
-                    name   = MOTOR_CONFIG[mid]["name"].replace("dof_", "")
-                    cur    = math.degrees(joint_pos[idx])
-                    target = math.degrees(actions[idx])
-                    torque = calc_torque(float(actions[idx]), joint_pos[idx],
-                                         joint_vel[idx],
-                                         MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"],
-                                         MAX_TORQUE[MOTOR_CONFIG[mid]["type"]])
-                    print(f"  {name}:{cur:5.1f}°→{target:5.1f}° τ={torque:5.1f}Nm", end="")
-                print()
+                    idx      = motor_id_to_policy_idx(mid)
+                    cfg      = MOTOR_CONFIG[mid]
+                    name     = cfg["name"].replace("dof_", "")
+                    cur      = math.degrees(joint_pos[idx])
+                    target   = math.degrees(actions[idx])
+                    max_t    = MAX_TORQUE[cfg["type"]]
+                    torque   = calc_torque(float(actions[idx]), joint_pos[idx],
+                                          joint_vel[idx], cfg["kp"], cfg["kd"], max_t)
+                    overload = abs(torque) >= max_t * 0.95
+                    flag     = " !!OVERLOAD" if overload else ""
+                    if overload:
+                        overload_flags.append(name)
+                    print(f"  {name:<28}  cur={cur:6.1f}°  tgt={target:6.1f}°  "
+                          f"τ={torque:6.1f}/{max_t:.0f}Nm{flag}")
+                if overload_flags:
+                    print(f"  [WARN] 扭矩過載: {overload_flags}")
 
             sim_t    += ctrl_dt
             step_cnt += 1
@@ -446,9 +455,25 @@ def run_replay(args, motor_ids: list, driver, bridge):
 # 模式 3：check  — 快速自動驗證
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _print_joint_limits_table():
+    """印出所有腿部關節的安全上下限表格。"""
+    print(f"\n  {'關節':<30}  {'下限(°)':>8}  {'上限(°)':>8}  {'範圍(°)':>8}  {'零位(°)':>8}")
+    print("  " + "-" * 68)
+    for name in RECORDING_JOINT_NAMES:
+        lo = math.degrees(SAFE_MIN[name])
+        hi = math.degrees(SAFE_MAX[name])
+        z  = _ZEROS_DEG[name]
+        print(f"  {name:<30}  {lo:8.1f}  {hi:8.1f}  {hi-lo:8.1f}  {z:8.1f}")
+    print()
+
+
 def run_check(args, bridge):
     print(f"\n=== 自動檢查模式（{args.steps} 步） ===")
     print(f"策略: {args.policy}\n")
+
+    # 印出關節安全限制表
+    print("  ── 腿部關節安全限制 ──")
+    _print_joint_limits_table()
 
     init_sess, step_sess, meta = load_kinfer(args.policy)
     num_commands = meta.get("num_commands", 0) or 0
@@ -459,12 +484,21 @@ def run_check(args, bridge):
     joint_pos = np.zeros(20, dtype=np.float32)
     joint_vel = np.zeros(20, dtype=np.float32)
 
+    # 記錄每個腿部關節的 policy 輸出歷程
+    _n_legs = len(RECORDING_JOINT_NAMES)
+    history = []   # list of float32 arrays (20-dim)
+
     results = {
         "步數": args.steps,
         "NaN/Inf": 0,
         "超安全範圍": 0,
+        "扭矩過載": 0,
         "錯誤": [],
     }
+
+    # CAN ID → policy index，只取腿部馬達
+    _leg_mid_order = [31, 32, 33, 34, 35, 41, 42, 43, 44, 45]
+    _leg_idx = [motor_id_to_policy_idx(m) for m in _leg_mid_order]
 
     for step in range(args.steps):
         sim_t = step * 0.02
@@ -478,6 +512,7 @@ def run_check(args, bridge):
 
         actions = outputs[0]
         carry   = outputs[1]
+        history.append(actions.copy())
 
         if np.any(np.isnan(actions)) or np.any(np.isinf(actions)):
             results["NaN/Inf"] += 1
@@ -486,33 +521,67 @@ def run_check(args, bridge):
         if not np.allclose(actions, clipped, atol=1e-6):
             results["超安全範圍"] += 1
 
+        # 扭矩過載檢查（模擬 PD 扭矩，joint_vel=0 因假設靜止）
+        for mid in _leg_mid_order:
+            idx    = motor_id_to_policy_idx(mid)
+            cfg    = MOTOR_CONFIG[mid]
+            torque = calc_torque(float(actions[idx]), joint_pos[idx], 0.0,
+                                 cfg["kp"], cfg["kd"], MAX_TORQUE[cfg["type"]])
+            if abs(torque) >= MAX_TORQUE[cfg["type"]] * 0.95:
+                results["扭矩過載"] += 1
+
         # 假設靜止：下一步 joint_pos 微移（模擬馬達跟隨）
         for i, name in enumerate(POLICY_JOINT_NAMES):
             if name in SAFE_MIN:
-                pid = i
-                joint_pos[pid] += (float(actions[pid]) - joint_pos[pid]) * 0.1
+                joint_pos[i] += (float(actions[i]) - joint_pos[i]) * 0.1
 
         if (step + 1) % 25 == 0:
             range_ok = np.allclose(actions, clipped, atol=1e-6)
-            print(f"  step {step+1:4d}  NaN={np.any(np.isnan(actions))}  "
-                  f"in_range={range_ok}  "
-                  f"leg_targets=[{', '.join(f'{math.degrees(float(actions[_REC_TO_POL[i]])):.1f}°' for i in range(5))}]")
+            vals = " ".join(f"{math.degrees(float(actions[i])):5.1f}°" for i in _leg_idx[:5])
+            print(f"  step {step+1:4d}  in_range={range_ok}  "
+                  f"right_leg=[{vals}]")
 
-    # 結果
-    print("\n" + "=" * 50)
+    # ── 每個腿部關節的 policy 輸出統計 ────────────────────────────────────────
+    if history:
+        hist_arr = np.array(history)   # (steps, 20)
+        print(f"\n  ── Policy 輸出統計（{len(history)} 步） ──")
+        print(f"  {'關節':<30}  {'最小(°)':>8}  {'最大(°)':>8}  {'均值(°)':>8}  "
+              f"{'安全下限':>8}  {'安全上限':>8}  {'狀態':>6}")
+        print("  " + "-" * 88)
+        any_oob = False
+        for mid in _leg_mid_order:
+            idx  = motor_id_to_policy_idx(mid)
+            name = MOTOR_CONFIG[mid]["name"]
+            col  = hist_arr[:, idx]
+            vmin = math.degrees(col.min())
+            vmax = math.degrees(col.max())
+            vmean= math.degrees(col.mean())
+            lo   = math.degrees(SAFE_MIN[name])
+            hi   = math.degrees(SAFE_MAX[name])
+            oob  = (vmin < lo - 0.1) or (vmax > hi + 0.1)
+            if oob:
+                any_oob = True
+            status = "[OOB!]" if oob else "[OK]  "
+            print(f"  {name:<30}  {vmin:8.1f}  {vmax:8.1f}  {vmean:8.1f}  "
+                  f"{lo:8.1f}  {hi:8.1f}  {status}")
+
+    # ── 最終摘要 ────────────────────────────────────────────────────────────────
+    print("\n" + "=" * 56)
     passed = results["NaN/Inf"] == 0 and not results["錯誤"]
     print(f"  策略檔    : {Path(args.policy).name}")
     print(f"  總步數    : {results['步數']}")
     print(f"  NaN/Inf  : {results['NaN/Inf']}  {'[FAIL]' if results['NaN/Inf'] else '[OK]'}")
     print(f"  超安全範圍: {results['超安全範圍']}  {'[WARN]' if results['超安全範圍'] else '[OK]'}")
+    print(f"  扭矩過載  : {results['扭矩過載']}  "
+          f"{'[WARN] 有步驟達到 95% 最大扭矩' if results['扭矩過載'] else '[OK]'}")
     if results["錯誤"]:
         print("  錯誤:")
         for e in results["錯誤"]:
             print(f"    {e}")
-    imu_str = "真實 H30 IMU" if bridge else "假 IMU"
+    imu_str = "真實 H30 IMU" if bridge else "假 IMU（直立靜止）"
     print(f"  IMU 模式  : {imu_str}")
     print(f"\n  結果: {'[PASS ✓]' if passed else '[FAIL ✗]'}")
-    print("=" * 50)
+    print("=" * 56)
     return passed
 
 
