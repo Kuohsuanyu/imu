@@ -40,8 +40,15 @@ _LINUX_IMU  = _HERE.parent / "imu"                    # linux/imu/
 _REPO_ROOT  = _HERE.parent.parent                     # repo 根目錄
 _KSIM_ROOT  = Path("/home/andykuo/ksim-gym")          # ksim-gym 根目錄
 
-# 預設策略檔（可用 --policy 覆蓋）
-DEFAULT_POLICY = _KSIM_ROOT / "kbot_robot" / "Policies" / "kbot_zero_position.kinfer"
+# 預設策略檔：優先找 repo 內 models/，其次 fallback 到 ksim-gym/kbot_robot/Policies/
+def _find_default_policy() -> Path:
+    models_dir = _REPO_ROOT / "models"
+    kinfers = sorted(models_dir.glob("*.kinfer"))
+    if kinfers:
+        return kinfers[-1]          # 字母序最後一個（通常最新）
+    return _KSIM_ROOT / "kbot_robot" / "Policies" / "kbot_zero_position.kinfer"
+
+DEFAULT_POLICY = _find_default_policy()
 
 # 錄製資料夾（來自 train_v1/test_policy.py 的錄製）
 RECORDINGS_DIR = _KSIM_ROOT / "recordings"
