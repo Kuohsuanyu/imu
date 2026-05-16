@@ -32,7 +32,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "imu"))
 
-import bridge_h30 as _b   # 只借用 _parse_yis_frame, 常數，不啟動虛擬串口
+import bridge_h30 as _bridge   # 只借用 _parse_yis_frame, 常數，不啟動虛擬串口
 
 import numpy as np
 
@@ -136,14 +136,14 @@ def run(port: str, duration: float | None):
             buf.extend(chunk)
             pos = 0
 
-            while pos < len(buf) - _b.PROTOCOL_MIN_LEN:
-                if buf[pos] != _b.YIS_H1 or buf[pos + 1] != _b.YIS_H2:
+            while pos < len(buf) - _bridge.PROTOCOL_MIN_LEN:
+                if buf[pos] != _bridge.YIS_H1 or buf[pos + 1] != _bridge.YIS_H2:
                     pos += 1
                     continue
-                payload_len = buf[pos + _b.PROTOCOL_LEN_POS]
-                if pos + _b.PROTOCOL_MIN_LEN + payload_len > len(buf):
+                payload_len = buf[pos + _bridge.PROTOCOL_LEN_POS]
+                if pos + _bridge.PROTOCOL_MIN_LEN + payload_len > len(buf):
                     break
-                result, next_pos = _b._parse_yis_frame(buf, pos)
+                result, next_pos = _bridge._parse_yis_frame(buf, pos)
                 if result is None:
                     pos += 1
                     continue
