@@ -86,6 +86,14 @@ MOTOR_CONFIG = {
 ACTUATOR_TYPE_MAP = {"02": "Robstride02", "03": "Robstride03", "04": "Robstride04"}
 MAX_TORQUE = {"04": 84.0, "03": 42.0, "02": 11.9}
 
+# 正弦波參數（與舊版 test_motor_policy.py 一致，已實測通過）
+SINE_AMP_RAD = {
+    "04": math.radians(15),   # hip pitch / knee ±15°
+    "03": math.radians(10),   # hip roll / yaw   ±10°
+    "02": math.radians(8),    # ankle             ±8°
+}
+SINE_FREQ_HZ = 0.3   # 0.3 Hz 慢速確認響應
+
 # 安全關節限制（policy 輸出的 hard clip）
 _ZEROS_DEG = {
     "dof_right_hip_pitch_04": -20.0, "dof_right_hip_roll_03":  0.0,
@@ -325,7 +333,116 @@ def run_policy(args, motor_ids: list, driver, bridge):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 模式 2：replay  — 從錄製 CSV 重播並驗證
+# 模式 2：zero  — 所有馬達歸零位（上電安全確認）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_zero(args, motor_ids: list, driver):
+    """將所有指定馬達保持在零位（組裝確認、上電安全測試）。"""
+    ctrl_dt   = 0.02
+    step_cnt  = 0
+    id_to_idx = {mid: motor_id_to_policy_idx(mid) for mid in motor_ids}
+    joint_pos = np.zeros(20, dtype=np.float32)
+    joint_vel = np.zeros(20, dtype=np.float32)
+
+    print(f"\n=== 零位模式（Ctrl+C 停止）{'[DRY RUN]' if args.dry_run else '[LIVE CAN]'} ===")
+    print("  ── 腿部關節安全限制 ──")
+    _print_joint_limits_table()
+
+    try:
+        while True:
+            t0 = time.time()
+            if driver:
+                read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
+            if not args.dry_run and driver:
+                for mid in motor_ids:
+                    send_cmd(driver, mid, 0.0, MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
+
+            if step_cnt % 50 == 0:
+                print(f"[t={step_cnt*ctrl_dt:6.1f}s]")
+                for mid in motor_ids:
+                    idx    = id_to_idx[mid]
+                    cfg    = MOTOR_CONFIG[mid]
+                    name   = cfg["name"].replace("dof_", "")
+                    cur    = math.degrees(joint_pos[idx])
+                    max_t  = MAX_TORQUE[cfg["type"]]
+                    torque = calc_torque(0.0, joint_pos[idx], joint_vel[idx],
+                                        cfg["kp"], cfg["kd"], max_t)
+                    flag   = " !!OVERLOAD" if abs(torque) >= max_t * 0.95 else ""
+                    print(f"  {name:<28}  cur={cur:6.1f}°  tgt=  0.0°  "
+                          f"τ={torque:6.1f}/{max_t:.0f}Nm{flag}")
+
+            step_cnt += 1
+            slp = ctrl_dt - (time.time() - t0)
+            if slp > 0:
+                time.sleep(slp)
+    except KeyboardInterrupt:
+        print("\n停止")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 模式 3：sine  — 正弦波運動（確認馬達響應，與舊版實測相同參數）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_sine(args, motor_ids: list, driver):
+    """正弦波運動：不需要 policy 檔案，用於確認每顆馬達響應與扭矩輸出。
+    參數與舊版 test_motor_policy.py sine 模式完全一致（已實測通過）：
+      type04 ±15°, type03 ±10°, type02 ±8°, 0.3 Hz
+    """
+    ctrl_dt   = 0.02
+    step_cnt  = 0
+    omega     = 2 * math.pi * SINE_FREQ_HZ
+    id_to_idx = {mid: motor_id_to_policy_idx(mid) for mid in motor_ids}
+    joint_pos = np.zeros(20, dtype=np.float32)
+    joint_vel = np.zeros(20, dtype=np.float32)
+
+    print(f"\n=== 正弦波模式 {SINE_FREQ_HZ} Hz（Ctrl+C 停止）"
+          f"{'[DRY RUN]' if args.dry_run else '[LIVE CAN]'} ===")
+    print(f"  振幅：type04=±15°  type03=±10°  type02=±8°")
+    print("  ── 腿部關節安全限制 ──")
+    _print_joint_limits_table()
+
+    try:
+        while True:
+            t0    = time.time()
+            sim_t = step_cnt * ctrl_dt
+
+            if driver:
+                read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
+
+            for mid in motor_ids:
+                cfg    = MOTOR_CONFIG[mid]
+                amp    = SINE_AMP_RAD[cfg["type"]]
+                target = amp * math.sin(omega * sim_t)
+                if not args.dry_run and driver:
+                    send_cmd(driver, mid, target, cfg["kp"], cfg["kd"])
+
+            if step_cnt % 50 == 0:
+                print(f"[t={sim_t:6.1f}s]")
+                for mid in motor_ids:
+                    idx    = id_to_idx[mid]
+                    cfg    = MOTOR_CONFIG[mid]
+                    name   = cfg["name"].replace("dof_", "")
+                    amp    = SINE_AMP_RAD[cfg["type"]]
+                    tgt    = amp * math.sin(omega * sim_t)
+                    cur    = joint_pos[idx]
+                    max_t  = MAX_TORQUE[cfg["type"]]
+                    torque = calc_torque(tgt, cur, joint_vel[idx],
+                                        cfg["kp"], cfg["kd"], max_t)
+                    flag   = " !!OVERLOAD" if abs(torque) >= max_t * 0.95 else ""
+                    print(f"  {name:<28}  tgt={math.degrees(tgt):6.1f}°  "
+                          f"cur={math.degrees(cur):6.1f}°  "
+                          f"τ={torque:6.1f}/{max_t:.0f}Nm{flag}")
+
+            step_cnt += 1
+            slp = ctrl_dt - (time.time() - t0)
+            if slp > 0:
+                time.sleep(slp)
+    except KeyboardInterrupt:
+        print("\n停止")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 模式 4：replay  — 從錄製 CSV 重播並驗證
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _latest_recording() -> Path | None:
@@ -595,9 +712,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 模式：
-  check  (預設) — 快速自動驗證 N 步推論
+  check  (預設) — 快速自動驗證 N 步推論（無硬體）
   policy        — 連續推論，可接真實 IMU 和馬達
   replay        — 從錄製 CSV 重播，自動比對 policy 輸出
+  zero          — 所有馬達歸零位（上電安全確認）
+  sine          — 正弦波運動測試（±15°/±10°/±8°, 0.3Hz，已實測通過）
 
 範例：
   python linux/test/test_policy.py
@@ -605,6 +724,9 @@ def main():
   python linux/test/test_policy.py --mode policy --dry-run
   python linux/test/test_policy.py --mode policy --imu --dry-run
   python linux/test/test_policy.py --mode policy --imu --can can0 --ids 31,32,33,34,35
+  python linux/test/test_policy.py --mode zero   --dry-run
+  python linux/test/test_policy.py --mode sine   --dry-run
+  python linux/test/test_policy.py --mode sine   --can can0 --ids 31,32,33,34,35
   python linux/test/test_policy.py --mode replay
   python linux/test/test_policy.py --mode replay --recording {RECORDINGS_DIR}/xxx.csv
 
@@ -615,7 +737,7 @@ def main():
 
     # 模式
     parser.add_argument("--mode", default="check",
-                        choices=["check", "policy", "replay"],
+                        choices=["check", "policy", "replay", "zero", "sine"],
                         help="測試模式（預設: check）")
 
     # 策略檔
@@ -659,9 +781,9 @@ def main():
     if args.imu:
         bridge = start_imu(args.imu_port, args.imu_baud)
 
-    # 馬達驅動器
+    # 馬達驅動器（check 不需要；其他模式 dry_run 時也不建立）
     driver = None
-    if not args.dry_run and args.mode != "check":
+    if not args.dry_run and args.mode not in ("check",):
         print(f"連接 CAN: {args.can}")
         driver = setup_driver(args.can, motor_ids)
         print()
@@ -674,6 +796,10 @@ def main():
             run_policy(args, motor_ids, driver, bridge)
         elif args.mode == "replay":
             run_replay(args, motor_ids, driver, bridge)
+        elif args.mode == "zero":
+            run_zero(args, motor_ids, driver)
+        elif args.mode == "sine":
+            run_sine(args, motor_ids, driver)
     finally:
         if driver:
             print("停用馬達...")
