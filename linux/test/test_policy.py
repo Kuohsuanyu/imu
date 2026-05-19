@@ -310,20 +310,28 @@ def read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx):
 # 模式 1：policy  — ONNX 推論
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _safe_step_rad(mid: int, torque_limit_ratio: float = 0.7) -> float:
+def _safe_step_rad(mid: int, torque_limit_ratio: float) -> float:
     """依關節 kp / max_torque 計算安全步長（rad）。
     保證單步最大扭矩 ≤ torque_limit_ratio × max_torque。
     """
     cfg = MOTOR_CONFIG[mid]
     max_t = MAX_TORQUE[cfg["type"]]
-    return (max_t * torque_limit_ratio) / cfg["kp"]   # F = kp * err → err_safe = F_safe / kp
+    return (max_t * torque_limit_ratio) / cfg["kp"]
+
+
+def torque_ratio(target_rad: float, cur_rad: float, vel_rad: float, mid: int) -> float:
+    """估算 PD 扭矩佔最大值的比例（0~1+）。"""
+    cfg   = MOTOR_CONFIG[mid]
+    max_t = MAX_TORQUE[cfg["type"]]
+    tau   = cfg["kp"] * (target_rad - cur_rad) + cfg["kd"] * (-vel_rad)
+    return abs(tau) / max_t
 
 
 def home_ramp(motor_ids: list, driver, id_to_idx: dict,
               joint_pos: np.ndarray, joint_vel: np.ndarray,
-              torque_limit_ratio: float = 0.7):
+              torque_limit_ratio: float = 0.5):
     """從當前位置緩慢移動到 ZEROS 初始姿態。
-    每顆馬達依自身 kp / max_torque 自動計算安全步長，確保任何時刻扭矩 ≤ 70% 上限。
+    每顆馬達依自身 kp / max_torque 自動計算安全步長，確保任何時刻扭矩 ≤ torque_limit_ratio。
     避免從任意位置開機後暴衝到初始姿態造成過載。
     """
     ctrl_dt = 0.02
@@ -331,7 +339,7 @@ def home_ramp(motor_ids: list, driver, id_to_idx: dict,
                     for mid in motor_ids if MOTOR_CONFIG[mid]["name"] in _ZEROS_DEG}
     safe_steps   = {mid: _safe_step_rad(mid, torque_limit_ratio) for mid in motor_ids}
 
-    _section("Home Ramp — 緩移至初始姿態（扭矩限制 ≤70% 最大值）")
+    _section(f"Home Ramp — 緩移至初始姿態（扭矩限制 ≤{torque_limit_ratio*100:.0f}%）")
     _info("目標: " + "  ".join(
         f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:10]}={math.degrees(home_targets[m]):+.0f}°"
         for m in motor_ids if m in home_targets))
@@ -413,7 +421,7 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
 
     # Home ramp：先緩移到初始姿態，避免從零位暴衝
     if driver and not args.skip_home_ramp:
-        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel)
+        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, args.torque_limit)
         input("\n  [確認] 已到達初始姿態，按 Enter 開始 Policy 推論...")
     elif args.skip_home_ramp:
         _warn("--skip-home-ramp：跳過 Home ramp，確認機器人已在初始姿態")
@@ -556,7 +564,7 @@ def run_stand(args, motor_ids: list, driver):
     print()
 
     if driver and not args.skip_home_ramp:
-        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel)
+        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, args.torque_limit)
 
     try:
         while True:
@@ -633,7 +641,7 @@ def run_sine(args, motor_ids: list, active_ids: list, driver):
 
     # 先移到站姿，再開始 sine
     if driver and not args.skip_home_ramp:
-        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel)
+        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, args.torque_limit)
         input("\n  [確認] 已到站姿，按 Enter 開始 sine 測試...")
 
     try:
@@ -736,9 +744,11 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
     ctrl_dt    = 0.02
     sim_t      = 0.0
 
-    errors   = []   # per-leg per-frame |policy_output - recorded_target|
-    oob_cnt  = 0    # out-of-safe-range count
+    errors        = []   # per-leg per-frame |policy_output - recorded_target|
+    torque_ratios = []   # per-leg per-frame estimated torque ratio
+    oob_cnt  = 0
     nan_cnt  = 0
+    tlimit   = args.torque_limit
 
     _section(f"重播中（{'DRY RUN' if args.dry_run else 'LIVE CAN'}）")
     print(f"  {'幀':>5}  {'時間':>6}  {'均誤差':>7}  {'超界':>4}  {'NaN':>4}  關節(cur→tgt)概覽")
@@ -772,14 +782,23 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
         if not np.allclose(actions, clipped, atol=1e-6):
             oob_cnt += 1
 
-        # 比對錄製 target
-        frame_err = []
+        # 比對錄製 target + 計算扭矩比
+        frame_err   = []
+        frame_tau   = []
         for rec_i, name in enumerate(RECORDING_JOINT_NAMES):
             pol_i      = _REC_TO_POL[rec_i]
             rec_target = float(row.get(f"target_{name}", 0))
             pol_target = float(actions[pol_i])
             frame_err.append(abs(pol_target - rec_target))
+            # 估算扭矩比（以錄製位置為當前，policy target 為目標）
+            mid_for_name = next((m for m, c in MOTOR_CONFIG.items() if c["name"] == name), None)
+            if mid_for_name:
+                frame_tau.append(torque_ratio(pol_target, joint_pos[pol_i],
+                                              joint_vel[pol_i], mid_for_name))
+            else:
+                frame_tau.append(0.0)
         errors.append(frame_err)
+        torque_ratios.append(frame_tau)
 
         # 送馬達（只有 active_ids 接收錄製 target，其餘保持零位）
         if not args.dry_run and driver:
@@ -790,7 +809,8 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
 
         if row_i % 50 == 0:
             mean_err = np.mean(frame_err) * 180 / math.pi
-            # Show first 3 leg joints as quick overview: cur→tgt
+            max_tau  = max(frame_tau) if frame_tau else 0.0
+            over_tag = f"  [OVER {max_tau*100:.0f}%]" if max_tau > tlimit else ""
             overview_parts = []
             for mid in motor_ids[:3]:
                 idx = motor_id_to_policy_idx(mid)
@@ -799,7 +819,7 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
                 nm = MOTOR_CONFIG[mid]["name"].replace("dof_left_","L.").replace("dof_right_","R.")
                 overview_parts.append(f"{nm}:{cur_d:+.0f}→{tgt_d:+.0f}°")
             print(f"  [{row_i:4d}/{len(rows)}]  t={sim_t:5.2f}s  "
-                  f"err={mean_err:5.2f}°  oob={oob_cnt:3d}  nan={nan_cnt:3d}  "
+                  f"err={mean_err:5.2f}°  τmax={max_tau*100:.0f}%  oob={oob_cnt:3d}{over_tag}  "
                   + "  ".join(overview_parts))
 
         sim_t += ctrl_dt
@@ -819,6 +839,25 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
         _ok(f"超範圍幀: {oob_cnt}")
     else:
         _warn(f"超範圍幀: {oob_cnt}")
+
+    tau_arr = np.array(torque_ratios)  # (N_frames, 10_legs)
+
+    _section(f"估算扭矩比（限制 {tlimit*100:.0f}%）")
+    print(f"  {'關節':<32}  {'均值%':>6}  {'最大%':>6}  {'P90%':>6}  狀態")
+    any_over = False
+    for i, name in enumerate(RECORDING_JOINT_NAMES):
+        col   = tau_arr[:, i] * 100
+        over  = col.max() > tlimit * 100
+        if over:
+            any_over = True
+        status = f"[OVER {col.max():.0f}%]" if over else "[OK]  "
+        print(f"  {name:<32}  {col.mean():6.1f}  {col.max():6.1f}  "
+              f"{np.percentile(col, 90):6.1f}  {status}")
+    print()
+    if any_over:
+        _warn(f"部分關節超過 {tlimit*100:.0f}% 扭矩限制，走路時建議降低策略輸出幅度或提高扭矩限制")
+    else:
+        _ok(f"所有關節扭矩均在 {tlimit*100:.0f}% 限制內")
 
     _section("policy 輸出 vs 錄製 target 偏差（deg）")
     print(f"  {'關節':<32}  {'均值':>6}  {'最大':>6}  {'P90':>6}  狀態")
@@ -917,13 +956,11 @@ def run_check(args, bridge):
         if not np.allclose(actions, clipped, atol=1e-6):
             results["超安全範圍"] += 1
 
-        # 扭矩過載檢查（模擬 PD 扭矩，joint_vel=0 因假設靜止）
+        # 扭矩過載檢查（以 torque_limit 為閾值）
         for mid in _leg_mid_order:
-            idx    = motor_id_to_policy_idx(mid)
-            cfg    = MOTOR_CONFIG[mid]
-            torque = calc_torque(float(actions[idx]), joint_pos[idx], 0.0,
-                                 cfg["kp"], cfg["kd"], MAX_TORQUE[cfg["type"]])
-            if abs(torque) >= MAX_TORQUE[cfg["type"]] * 0.95:
+            idx = motor_id_to_policy_idx(mid)
+            tr  = torque_ratio(float(actions[idx]), joint_pos[idx], 0.0, mid)
+            if tr >= args.torque_limit:
                 results["扭矩過載"] += 1
 
         # 假設靜止：下一步 joint_pos 微移（模擬馬達跟隨）
@@ -980,9 +1017,9 @@ def run_check(args, bridge):
     else:
         _warn(f"超安全範圍: {results['超安全範圍']}")
     if results["扭矩過載"] == 0:
-        _ok(f"扭矩過載  : {results['扭矩過載']}")
+        _ok(f"扭矩過載  : {results['扭矩過載']}  （閾值 {args.torque_limit*100:.0f}%）")
     else:
-        _warn(f"扭矩過載  : {results['扭矩過載']}  （有步驟達到 95% 最大扭矩）")
+        _warn(f"扭矩過載  : {results['扭矩過載']}  （超過 {args.torque_limit*100:.0f}% 最大扭矩）")
     if results["錯誤"]:
         for e in results["錯誤"]:
             _fail(f"錯誤: {e}")
@@ -1035,6 +1072,11 @@ def main():
     # 策略檔
     parser.add_argument("--policy", default=str(DEFAULT_POLICY),
                         help=f"kinfer 路徑（預設: {DEFAULT_POLICY.name}）")
+
+    # 安全限制
+    parser.add_argument("--torque-limit", type=float, default=0.5,
+                        help="扭矩安全上限（佔最大值比例，預設 0.5 = 50%%）；"
+                             "用於 home_ramp 步長計算與 replay/check 過載判定")
 
     # 錄製
     parser.add_argument("--recording", default=None,
@@ -1097,6 +1139,7 @@ def main():
     if args.active_ids:
         _info(f"Active  : {active_ids}  （其餘保持零位）")
     _info(f"IMU     : {'H30 USB — ' + args.imu_port if args.imu else '假 IMU（靜止直立）'}")
+    _info(f"扭矩限制: {args.torque_limit*100:.0f}%  （home_ramp 步長 + replay/check 警告閾值）")
     _section("馬達配置")
     print(f"  {'ID':>3}  {'關節名稱':<28}  {'型號':>4}  {'kp':>6}  {'kd':>6}  {'最大扭矩':>8}")
     for mid in motor_ids:
