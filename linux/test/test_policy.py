@@ -90,8 +90,9 @@ RECORDING_JOINT_NAMES = [
     "dof_left_hip_pitch_04",  "dof_left_hip_roll_03",  "dof_left_hip_yaw_03",
     "dof_left_knee_04",       "dof_left_ankle_02",
 ]
-# 錄製關節 → policy 20-dim 索引的對應
+# 錄製關節 → policy 20-dim 索引的對應（也是腿部 10 關節在 20-dim 中的位置）
 _REC_TO_POL = [POLICY_JOINT_NAMES.index(n) for n in RECORDING_JOINT_NAMES]
+_LEG_INDICES = np.array(_REC_TO_POL, dtype=np.int32)  # 10 個腿部索引
 
 # ── CAN ID → 關節名稱、型號、PD 增益（10 腿部馬達）────────────────────────────
 MOTOR_CONFIG = {
@@ -155,14 +156,39 @@ def load_kinfer(path: str | Path):
     return init_sess, step_sess, meta
 
 
+def _n_joints(step_sess) -> int:
+    """回傳模型期望的關節數（10 腿部 or 20 全身）。"""
+    for inp in step_sess.get_inputs():
+        if inp.name == "joint_angles":
+            return int(inp.shape[0])
+    return 20
+
+
+def expand_actions(actions, joint_pos) -> np.ndarray:
+    """把 10-dim 腿部 actions 展開為 20-dim；20-dim 直接返回。"""
+    if len(actions) == 20:
+        return actions
+    out = joint_pos.copy()          # 手臂保持當前位置
+    for leg_i, pol_i in enumerate(_LEG_INDICES):
+        out[pol_i] = actions[leg_i]
+    return out
+
+
 def build_policy_feed(step_sess, joint_pos, joint_vel, carry, num_commands, sim_t,
                       bridge=None):
     """組裝 policy 輸入字典。bridge 不為 None 時讀真實 IMU。"""
     import threading
     names = {i.name for i in step_sess.get_inputs()}
+    n = _n_joints(step_sess)
+    if n == 10:
+        jpos = joint_pos[_LEG_INDICES].astype(np.float32)
+        jvel = joint_vel[_LEG_INDICES].astype(np.float32)
+    else:
+        jpos = joint_pos.astype(np.float32)
+        jvel = joint_vel.astype(np.float32)
     feed = {
-        "joint_angles":             joint_pos.astype(np.float32),
-        "joint_angular_velocities": joint_vel.astype(np.float32),
+        "joint_angles":             jpos,
+        "joint_angular_velocities": jvel,
         "carry":                    carry,
     }
     if bridge is not None:
@@ -382,7 +408,7 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
             feed    = build_policy_feed(step_sess, joint_pos, joint_vel, carry,
                                         num_commands, sim_t, bridge)
             outputs = step_sess.run(None, feed)
-            actions = np.clip(outputs[0], _SAFE_MIN_ARR, _SAFE_MAX_ARR)
+            actions = np.clip(expand_actions(outputs[0], joint_pos), _SAFE_MIN_ARR, _SAFE_MAX_ARR)
             carry   = outputs[1]
 
             if not args.dry_run and driver:
@@ -716,7 +742,7 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
         feed    = build_policy_feed(step_sess, joint_pos, joint_vel, carry,
                                     num_commands, sim_t, bridge)
         outputs = step_sess.run(None, feed)
-        actions = outputs[0]
+        actions = expand_actions(outputs[0], joint_pos)
         carry   = outputs[1]
 
         # 自動檢查
@@ -854,7 +880,7 @@ def run_check(args, bridge):
             results["錯誤"].append(f"step {step}: {e}")
             continue
 
-        actions = outputs[0]
+        actions = expand_actions(outputs[0], joint_pos)
         carry   = outputs[1]
         history.append(actions.copy())
 
