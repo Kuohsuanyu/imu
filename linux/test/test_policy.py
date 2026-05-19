@@ -748,6 +748,7 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
 
     errors        = []   # per-leg per-frame |policy_output - recorded_target|
     torque_ratios = []   # per-leg per-frame estimated torque ratio
+    positions     = []   # per-leg per-frame commanded target position (deg)
     oob_cnt  = 0
     nan_cnt  = 0
     tlimit   = args.torque_limit
@@ -807,6 +808,8 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
                 frame_tau.append(0.0)
         errors.append(frame_err)
         torque_ratios.append(frame_tau)
+        positions.append([math.degrees(float(actions[_REC_TO_POL[i]]))
+                          for i in range(len(RECORDING_JOINT_NAMES))])
 
         # 送馬達
         if not args.dry_run and driver:
@@ -850,6 +853,23 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
         _warn(f"超範圍幀: {oob_cnt}")
 
     tau_arr = np.array(torque_ratios)  # (N_frames, 10_legs)
+    pos_arr = np.array(positions)      # (N_frames, 10_legs) in degrees
+
+    _section(f"各馬達位置行程（{float(rows[-1]['time_s']):.1f}s 內）")
+    print(f"  {'ID':>3}  {'關節':<26}  {'起始°':>7}  {'最小°':>7}  {'最大°':>7}  {'均值°':>7}  {'行程°':>7}")
+    for i, name in enumerate(RECORDING_JOINT_NAMES):
+        col     = pos_arr[:, i]
+        mid     = next(m for m, c in MOTOR_CONFIG.items() if c["name"] == name)
+        lo, hi  = SAFE_MIN[name], SAFE_MAX[name]
+        start   = col[0]
+        mn, mx, mean = col.min(), col.max(), col.mean()
+        travel  = mx - mn
+        # 超界標記
+        oob_tag = ""
+        if mn < math.degrees(lo) - 0.1 or mx > math.degrees(hi) + 0.1:
+            oob_tag = " [OOB!]"
+        print(f"  {mid:>3}  {name.replace('dof_',''):<26}  {start:>+7.1f}  "
+              f"{mn:>+7.1f}  {mx:>+7.1f}  {mean:>+7.1f}  {travel:>7.1f}{oob_tag}")
 
     _section(f"估算扭矩比（限制 {tlimit*100:.0f}%）")
     print(f"  {'關節':<32}  {'均值%':>6}  {'最大%':>6}  {'P90%':>6}  狀態")
