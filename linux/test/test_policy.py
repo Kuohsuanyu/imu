@@ -729,14 +729,18 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
         rows = list(csv.DictReader(f))
     _ok(f"載入 {len(rows)} 幀，時長 {float(rows[-1]['time_s']):.2f}s")
 
-    # 載入 policy
-    _section("載入策略")
-    _info(f"檔案: {Path(args.policy).name}")
-    init_sess, step_sess, meta = load_kinfer(args.policy)
-    num_commands = meta.get("num_commands", 0) or 0
-    carry_init   = init_sess.run(None, {})
-    carry_size   = meta["carry_size"]
-    carry        = carry_init[0] if carry_init else np.zeros(carry_size, dtype=np.float32)
+    # 載入 policy（--no-policy 時跳過）
+    if args.no_policy:
+        _info("模式：CSV 直播（--no-policy），直接送錄製 target，不跑 policy 推論")
+        step_sess = num_commands = carry = None
+    else:
+        _section("載入策略")
+        _info(f"檔案: {Path(args.policy).name}")
+        init_sess, step_sess, meta = load_kinfer(args.policy)
+        num_commands = meta.get("num_commands", 0) or 0
+        carry_init   = init_sess.run(None, {})
+        carry_size   = meta["carry_size"]
+        carry        = carry_init[0] if carry_init else np.zeros(carry_size, dtype=np.float32)
 
     id_to_idx  = {mid: motor_id_to_policy_idx(mid) for mid in motor_ids}
     ctrl_dt    = 0.02
@@ -757,40 +761,46 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
         # 從錄製讀取關節狀態
         joint_pos = np.zeros(20, dtype=np.float32)
         joint_vel = np.zeros(20, dtype=np.float32)
+        rec_targets_20 = np.zeros(20, dtype=np.float32)
         for rec_i, name in enumerate(RECORDING_JOINT_NAMES):
             pol_i = _REC_TO_POL[rec_i]
-            joint_pos[pol_i] = float(row.get(f"pos_{name}", 0))
-            joint_vel[pol_i] = float(row.get(f"vel_{name}", 0))
+            joint_pos[pol_i]     = float(row.get(f"pos_{name}", 0))
+            joint_vel[pol_i]     = float(row.get(f"vel_{name}", 0))
+            rec_targets_20[pol_i] = float(row.get(f"target_{name}", 0))
 
         # 如果有真實馬達，也讀取回饋（overlay 真實值）
         if driver:
             read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
 
-        # policy 推論（假 IMU，replay 時統一用靜止直立）
-        feed    = build_policy_feed(step_sess, joint_pos, joint_vel, carry,
-                                    num_commands, sim_t, bridge)
-        outputs = step_sess.run(None, feed)
-        actions = expand_actions(outputs[0], joint_pos)
-        carry   = outputs[1]
+        if args.no_policy:
+            # ── CSV 直播模式：直接送錄製 target，不跑 policy ────────────────
+            actions = rec_targets_20
+            clipped = np.clip(actions, _SAFE_MIN_ARR, _SAFE_MAX_ARR)
+        else:
+            # ── Policy 推論模式：用 v20 policy 重新計算目標 ─────────────────
+            feed    = build_policy_feed(step_sess, joint_pos, joint_vel, carry,
+                                        num_commands, sim_t, bridge)
+            outputs = step_sess.run(None, feed)
+            actions = expand_actions(outputs[0], joint_pos)
+            carry   = outputs[1]
 
-        # 自動檢查
-        if np.any(np.isnan(actions)) or np.any(np.isinf(actions)):
-            nan_cnt += 1
-        clipped = np.clip(actions, _SAFE_MIN_ARR, _SAFE_MAX_ARR)
-        if not np.allclose(actions, clipped, atol=1e-6):
-            oob_cnt += 1
+            if np.any(np.isnan(actions)) or np.any(np.isinf(actions)):
+                nan_cnt += 1
+            clipped = np.clip(actions, _SAFE_MIN_ARR, _SAFE_MAX_ARR)
+            if not np.allclose(actions, clipped, atol=1e-6):
+                oob_cnt += 1
 
         # 比對錄製 target + 計算扭矩比
         frame_err   = []
         frame_tau   = []
         for rec_i, name in enumerate(RECORDING_JOINT_NAMES):
             pol_i      = _REC_TO_POL[rec_i]
-            rec_target = float(row.get(f"target_{name}", 0))
+            rec_target = rec_targets_20[pol_i]
             pol_target = float(actions[pol_i])
             frame_err.append(abs(pol_target - rec_target))
-            # 估算扭矩比（以錄製位置為當前，policy target 為目標）
             mid_for_name = next((m for m, c in MOTOR_CONFIG.items() if c["name"] == name), None)
             if mid_for_name:
+                # 扭矩估算：從當前位置到目標的誤差
                 frame_tau.append(torque_ratio(pol_target, joint_pos[pol_i],
                                               joint_vel[pol_i], mid_for_name))
             else:
@@ -798,11 +808,12 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
         errors.append(frame_err)
         torque_ratios.append(frame_tau)
 
-        # 送馬達（只有 active_ids 接收錄製 target，其餘保持零位）
+        # 送馬達
         if not args.dry_run and driver:
             for mid in motor_ids:
                 idx = motor_id_to_policy_idx(mid)
-                pos = float(clipped[idx]) if mid in active_set else 0.0
+                pos = float(clipped[idx]) if mid in active_set else \
+                      math.radians(_ZEROS_DEG.get(MOTOR_CONFIG[mid]["name"], 0.0))
                 send_cmd(driver, mid, pos, MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
 
         if row_i % 50 == 0:
@@ -1089,6 +1100,9 @@ def main():
                              "  例: --active-ids 34,44 只動兩個膝關節")
     parser.add_argument("--dry-run", action="store_true",
                         help="不送 CAN 指令，只印推論結果")
+    parser.add_argument("--no-policy", action="store_true",
+                        help="replay 模式：直接送 CSV 錄製 target，不跑 policy 推論"
+                             "（用於確認錄製動作本身的安全性，排除 model 版本差異影響）")
     parser.add_argument("--skip-home-ramp", action="store_true",
                         help="跳過 Home ramp 階段（只在機器人已在初始姿態時使用）")
 
