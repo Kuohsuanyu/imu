@@ -37,21 +37,19 @@ import onnxruntime as ort
 # ── 路徑設定（從本檔案位置自動推算，不需手動改路徑）────────────────────────────
 _HERE       = Path(__file__).resolve().parent          # linux/test/
 _LINUX_IMU  = _HERE.parent / "imu"                    # linux/imu/
-_REPO_ROOT  = _HERE.parent.parent                     # repo 根目錄
-_KSIM_ROOT  = Path("/home/andykuo/ksim-gym")          # ksim-gym 根目錄
+_REPO_ROOT  = _HERE.parent.parent                     # repo 根目錄（imu/）
 
-# 預設策略檔：優先找 repo 內 models/，其次 fallback 到 ksim-gym/kbot_robot/Policies/
+# 預設策略檔：優先找 repo 內 models/
 def _find_default_policy() -> Path:
-    models_dir = _REPO_ROOT / "models"
-    kinfers = sorted(models_dir.glob("*.kinfer"))
+    kinfers = sorted((_REPO_ROOT / "models").glob("*.kinfer"))
     if kinfers:
         return kinfers[-1]
-    return _KSIM_ROOT / "kbot_robot" / "Policies" / "kbot_zero_position.kinfer"
+    raise FileNotFoundError(f"找不到 .kinfer 模型，請將模型放入 {_REPO_ROOT / 'models'}/")
 
 DEFAULT_POLICY = _find_default_policy()
 
-# 錄製資料夾（來自 train_v1/test_policy.py 的錄製）
-RECORDINGS_DIR = _KSIM_ROOT / "recordings"
+# 錄製資料夾：repo 內的 recordings/（跨機器一致）
+RECORDINGS_DIR = _REPO_ROOT / "recordings"
 
 
 # ── CLI 輸出工具 ──────────────────────────────────────────────────────────────
