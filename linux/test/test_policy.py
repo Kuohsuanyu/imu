@@ -310,21 +310,34 @@ def read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx):
 # 模式 1：policy  — ONNX 推論
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _safe_step_rad(mid: int, torque_limit_ratio: float = 0.7) -> float:
+    """依關節 kp / max_torque 計算安全步長（rad）。
+    保證單步最大扭矩 ≤ torque_limit_ratio × max_torque。
+    """
+    cfg = MOTOR_CONFIG[mid]
+    max_t = MAX_TORQUE[cfg["type"]]
+    return (max_t * torque_limit_ratio) / cfg["kp"]   # F = kp * err → err_safe = F_safe / kp
+
+
 def home_ramp(motor_ids: list, driver, id_to_idx: dict,
               joint_pos: np.ndarray, joint_vel: np.ndarray,
-              ramp_deg_per_step: float = 4.0):
-    """從當前位置緩慢移動到 home position（每 20ms 最多 ramp_deg_per_step 度）。
-    與 firmware Home state 邏輯完全一致，避免從零位暴衝到初始姿態。
+              torque_limit_ratio: float = 0.7):
+    """從當前位置緩慢移動到 ZEROS 初始姿態。
+    每顆馬達依自身 kp / max_torque 自動計算安全步長，確保任何時刻扭矩 ≤ 70% 上限。
+    避免從任意位置開機後暴衝到初始姿態造成過載。
     """
     ctrl_dt = 0.02
-    ramp_rad = math.radians(ramp_deg_per_step)
     home_targets = {mid: math.radians(_ZEROS_DEG[MOTOR_CONFIG[mid]["name"]])
                     for mid in motor_ids if MOTOR_CONFIG[mid]["name"] in _ZEROS_DEG}
+    safe_steps   = {mid: _safe_step_rad(mid, torque_limit_ratio) for mid in motor_ids}
 
-    _section(f"Home Ramp — 緩移至初始姿態（每步 ≤{ramp_deg_per_step}°，20ms/步）")
+    _section("Home Ramp — 緩移至初始姿態（扭矩限制 ≤70% 最大值）")
     _info("目標: " + "  ".join(
         f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:10]}={math.degrees(home_targets[m]):+.0f}°"
         for m in motor_ids if m in home_targets))
+    _info("安全步長: " + "  ".join(
+        f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:10]}≤{math.degrees(safe_steps[m]):.1f}°"
+        for m in motor_ids))
 
     step = 0
     while True:
@@ -332,23 +345,30 @@ def home_ramp(motor_ids: list, driver, id_to_idx: dict,
         read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
 
         max_err = 0.0
+        max_torque_ratio = 0.0
         for mid in motor_ids:
             if mid not in home_targets:
                 continue
-            idx = id_to_idx[mid]
-            err = home_targets[mid] - joint_pos[idx]
-            max_err = max(max_err, abs(err))
-            step_pos = joint_pos[idx] + math.copysign(min(abs(err), ramp_rad), err)
-            send_cmd(driver, mid, step_pos,
-                     MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
+            idx      = id_to_idx[mid]
+            cfg      = MOTOR_CONFIG[mid]
+            err      = home_targets[mid] - joint_pos[idx]
+            max_err  = max(max_err, abs(err))
+            clamp    = safe_steps[mid]
+            step_pos = joint_pos[idx] + math.copysign(min(abs(err), clamp), err)
+            est_torque = cfg["kp"] * abs(step_pos - joint_pos[idx])
+            max_torque_ratio = max(max_torque_ratio,
+                                   est_torque / MAX_TORQUE[cfg["type"]])
+            send_cmd(driver, mid, step_pos, cfg["kp"], cfg["kd"])
 
-        if step % 50 == 0:
+        if step % 25 == 0:
             print(f"  [{step*ctrl_dt:5.1f}s] max_err={math.degrees(max_err):.1f}°  "
-                  f"joints=[" + " ".join(f"{math.degrees(joint_pos[id_to_idx[m]]):+.1f}"
-                                         for m in motor_ids if m in home_targets) + "]°")
+                  f"max_τ={max_torque_ratio*100:.0f}%  "
+                  + "  ".join(f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:8]}"
+                               f"={math.degrees(joint_pos[id_to_idx[m]]):+.1f}°"
+                               for m in motor_ids if m in home_targets))
 
-        if max_err < 0.1:   # ~5.7°，與 firmware 相同閾值
-            _ok(f"Home Ramp 完成：誤差 {math.degrees(max_err):.2f}° < 5.7°，共 {step} 步 ({step*ctrl_dt:.1f}s)")
+        if max_err < 0.1:
+            _ok(f"Home Ramp 完成：誤差 {math.degrees(max_err):.2f}°，共 {step} 步 ({step*ctrl_dt:.1f}s)，最大扭矩比 {max_torque_ratio*100:.0f}%")
             break
 
         step += 1
@@ -851,8 +871,14 @@ def run_check(args, bridge):
     carry_size   = meta["carry_size"]
     carry        = carry_init[0] if carry_init else np.zeros(carry_size, dtype=np.float32)
 
+    # 從 ZEROS 站姿開始（模擬 home_ramp 已完成），讓扭矩檢查反映真實運行狀況
     joint_pos = np.zeros(20, dtype=np.float32)
     joint_vel = np.zeros(20, dtype=np.float32)
+    _leg_mid_all = [31, 32, 33, 34, 35, 41, 42, 43, 44, 45]
+    for mid in _leg_mid_all:
+        idx = motor_id_to_policy_idx(mid)
+        joint_pos[idx] = math.radians(_ZEROS_DEG.get(MOTOR_CONFIG[mid]["name"], 0.0))
+    _info("起始姿態：ZEROS 站姿（模擬 home_ramp 完成後）")
 
     # 記錄每個腿部關節的 policy 輸出歷程
     _n_legs = len(RECORDING_JOINT_NAMES)
@@ -867,7 +893,7 @@ def run_check(args, bridge):
     }
 
     # CAN ID → policy index，只取腿部馬達
-    _leg_mid_order = [31, 32, 33, 34, 35, 41, 42, 43, 44, 45]
+    _leg_mid_order = _leg_mid_all
     _leg_idx = [motor_id_to_policy_idx(m) for m in _leg_mid_order]
 
     for step in range(args.steps):
