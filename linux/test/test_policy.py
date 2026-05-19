@@ -45,13 +45,29 @@ def _find_default_policy() -> Path:
     models_dir = _REPO_ROOT / "models"
     kinfers = sorted(models_dir.glob("*.kinfer"))
     if kinfers:
-        return kinfers[-1]          # 字母序最後一個（通常最新）
+        return kinfers[-1]
     return _KSIM_ROOT / "kbot_robot" / "Policies" / "kbot_zero_position.kinfer"
 
 DEFAULT_POLICY = _find_default_policy()
 
 # 錄製資料夾（來自 train_v1/test_policy.py 的錄製）
 RECORDINGS_DIR = _KSIM_ROOT / "recordings"
+
+
+# ── CLI 輸出工具 ──────────────────────────────────────────────────────────────
+
+def _banner(title: str, width: int = 60):
+    print("\n" + "═" * width)
+    print(f"  {title}")
+    print("═" * width)
+
+def _section(title: str):
+    print(f"\n  ── {title} ──")
+
+def _ok(msg: str):   print(f"  [OK]   {msg}")
+def _warn(msg: str): print(f"  [WARN] {msg}")
+def _fail(msg: str): print(f"  [FAIL] {msg}")
+def _info(msg: str): print(f"  {msg}")
 
 # ── 策略關節順序（20-dim，ONNX 模型輸入/輸出順序）────────────────────────────────
 POLICY_JOINT_NAMES = [
@@ -203,15 +219,14 @@ def start_imu(imu_port: str = "/dev/ttyACM0", imu_baud: int = 460800):
     t = threading.Thread(target=_run, daemon=True, name="h30-bridge")
     t.start()
 
-    print(f"[IMU] 啟動 H30 bridge {imu_port} @ {imu_baud} baud，等待資料...")
+    _info(f"啟動 H30 bridge {imu_port} @ {imu_baud} baud，等待資料...")
     for _ in range(200):
         time.sleep(0.1)
         with bridge._imu_lock:
             if bridge.IMU_STATE["updated"]:
-                break
-    else:
-        print("[WARN] 20 秒內未收到 IMU 資料，使用假值繼續")
-    print("[IMU] 就緒")
+                _ok(f"IMU 就緒（{imu_port} @ {imu_baud}）")
+                return bridge
+    _warn("20 秒內未收到 IMU 資料，使用假值繼續")
     return bridge
 
 
@@ -226,7 +241,7 @@ def setup_driver(can_iface: str, motor_ids: list):
         atype = getattr(PyRobstrideActuatorType, ACTUATOR_TYPE_MAP[cfg["type"]])
         driver.add_actuator(can_id=mid, actuator_type=atype)
         driver.enable_actuator(actuator_id=mid)
-        print(f"  馬達 {mid:2d} ({cfg['name']:<28}) 已啟用")
+        _ok(f"馬達 {mid:2d} ({cfg['name']:<28}) 已啟用")
     return driver
 
 
@@ -265,13 +280,66 @@ def read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx):
 # 模式 1：policy  — ONNX 推論
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_policy(args, motor_ids: list, driver, bridge):
-    print(f"\n載入策略: {args.policy}")
+def home_ramp(motor_ids: list, driver, id_to_idx: dict,
+              joint_pos: np.ndarray, joint_vel: np.ndarray,
+              ramp_deg_per_step: float = 4.0):
+    """從當前位置緩慢移動到 home position（每 20ms 最多 ramp_deg_per_step 度）。
+    與 firmware Home state 邏輯完全一致，避免從零位暴衝到初始姿態。
+    """
+    ctrl_dt = 0.02
+    ramp_rad = math.radians(ramp_deg_per_step)
+    home_targets = {mid: math.radians(_ZEROS_DEG[MOTOR_CONFIG[mid]["name"]])
+                    for mid in motor_ids if MOTOR_CONFIG[mid]["name"] in _ZEROS_DEG}
+
+    _section(f"Home Ramp — 緩移至初始姿態（每步 ≤{ramp_deg_per_step}°，20ms/步）")
+    _info("目標: " + "  ".join(
+        f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:10]}={math.degrees(home_targets[m]):+.0f}°"
+        for m in motor_ids if m in home_targets))
+
+    step = 0
+    while True:
+        t0 = time.time()
+        read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
+
+        max_err = 0.0
+        for mid in motor_ids:
+            if mid not in home_targets:
+                continue
+            idx = id_to_idx[mid]
+            err = home_targets[mid] - joint_pos[idx]
+            max_err = max(max_err, abs(err))
+            step_pos = joint_pos[idx] + math.copysign(min(abs(err), ramp_rad), err)
+            send_cmd(driver, mid, step_pos,
+                     MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
+
+        if step % 50 == 0:
+            print(f"  [{step*ctrl_dt:5.1f}s] max_err={math.degrees(max_err):.1f}°  "
+                  f"joints=[" + " ".join(f"{math.degrees(joint_pos[id_to_idx[m]]):+.1f}"
+                                         for m in motor_ids if m in home_targets) + "]°")
+
+        if max_err < 0.1:   # ~5.7°，與 firmware 相同閾值
+            _ok(f"Home Ramp 完成：誤差 {math.degrees(max_err):.2f}° < 5.7°，共 {step} 步 ({step*ctrl_dt:.1f}s)")
+            break
+
+        step += 1
+        slp = ctrl_dt - (time.time() - t0)
+        if slp > 0:
+            time.sleep(slp)
+
+
+def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
+    _banner("Policy 模式 — ONNX 即時推論")
+    _section("載入策略")
+    _info(f"檔案: {Path(args.policy).name}")
     init_sess, step_sess, meta = load_kinfer(args.policy)
     input_names  = [i.name for i in step_sess.get_inputs()]
     num_commands = meta.get("num_commands", 0) or 0
     carry_size   = meta["carry_size"]
-    print(f"  輸入: {input_names}  carry_size={carry_size}  commands={num_commands}")
+    _info(f"輸入: {input_names}")
+    _info(f"carry_size={carry_size}  commands={num_commands}")
+    if active_ids != motor_ids:
+        active_names = [MOTOR_CONFIG[m]["name"].replace("dof_","") for m in active_ids]
+        _warn(f"只有 {active_ids} ({active_names}) 接收 policy 指令")
 
     carry_init = init_sess.run(None, {})
     carry = carry_init[0] if carry_init else np.zeros(carry_size, dtype=np.float32)
@@ -285,11 +353,22 @@ def run_policy(args, motor_ids: list, driver, bridge):
     joint_vel = np.zeros(20, dtype=np.float32)
 
     imu_info = "真實 H30 IMU" if bridge is not None else "假 IMU（直立靜止）"
-    print(f"\n=== Policy 模式 | {imu_info} | {'DRY RUN' if args.dry_run else 'LIVE CAN'} ===")
-    print("Ctrl+C 停止")
-    print("\n  ── 腿部關節安全限制 ──")
+    _section(f"運行配置")
+    _info(f"IMU   : {imu_info}")
+    _info(f"CAN   : {'DRY RUN（不送指令）' if args.dry_run else f'LIVE — {args.can}'}")
+    _info(f"馬達  : {motor_ids}")
+    _info(f"Active: {active_ids}")
+    _section("腿部關節安全限制")
     _print_joint_limits_table()
 
+    # Home ramp：先緩移到初始姿態，避免從零位暴衝
+    if driver and not args.skip_home_ramp:
+        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel)
+        input("\n  [確認] 已到達初始姿態，按 Enter 開始 Policy 推論...")
+    elif args.skip_home_ramp:
+        _warn("--skip-home-ramp：跳過 Home ramp，確認機器人已在初始姿態")
+
+    _info("Ctrl+C 停止")
     try:
         while True:
             t0 = time.time()
@@ -305,29 +384,42 @@ def run_policy(args, motor_ids: list, driver, bridge):
             if not args.dry_run and driver:
                 for mid in motor_ids:
                     idx = motor_id_to_policy_idx(mid)
-                    send_cmd(driver, mid, float(actions[idx]),
-                             MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
+                    pos = float(actions[idx]) if mid in active_ids else 0.0
+                    send_cmd(driver, mid, pos, MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
 
             if step_cnt % 50 == 0:
                 overload_flags = []
-                print(f"[t={sim_t:6.2f}s]")
+                print(f"\n[t={sim_t:6.2f}s  step={step_cnt}]")
+                # IMU 資料
+                if bridge is not None:
+                    with bridge._imu_lock:
+                        _acc  = bridge.IMU_STATE["acc"].copy()
+                        _gyro = bridge.IMU_STATE["gyro"].copy()
+                        _quat = bridge.IMU_STATE["quat"].copy()
+                    _pg = bridge.proj_gravity_from_quat(*_quat)
+                    print(f"  IMU acc=[{_acc[0]:+.3f} {_acc[1]:+.3f} {_acc[2]:+.3f}]m/s²  "
+                          f"gyro=[{_gyro[0]:+.3f} {_gyro[1]:+.3f} {_gyro[2]:+.3f}]rad/s  "
+                          f"pg=[{_pg[0]:+.3f} {_pg[1]:+.3f} {_pg[2]:+.3f}]")
+                print(f"  {'關節':<26}  {'cur(°)':>7}  {'tgt(°)':>7}  {'err(°)':>6}  {'τ(Nm)':>12}")
                 for mid in motor_ids:
                     idx      = motor_id_to_policy_idx(mid)
                     cfg      = MOTOR_CONFIG[mid]
                     name     = cfg["name"].replace("dof_", "")
                     cur      = math.degrees(joint_pos[idx])
                     target   = math.degrees(actions[idx])
+                    err      = target - cur
                     max_t    = MAX_TORQUE[cfg["type"]]
                     torque   = calc_torque(float(actions[idx]), joint_pos[idx],
                                           joint_vel[idx], cfg["kp"], cfg["kd"], max_t)
                     overload = abs(torque) >= max_t * 0.95
-                    flag     = " !!OVERLOAD" if overload else ""
+                    flag     = " !OVERLOAD" if overload else ""
+                    active_tag = "" if mid in set(active_ids) else " [hold]"
                     if overload:
                         overload_flags.append(name)
-                    print(f"  {name:<28}  cur={cur:6.1f}°  tgt={target:6.1f}°  "
-                          f"τ={torque:6.1f}/{max_t:.0f}Nm{flag}")
+                    print(f"  {name:<26}  {cur:>+7.1f}  {target:>+7.1f}  {err:>+6.1f}  "
+                          f"{torque:>+7.1f}/{max_t:>3.0f}Nm{flag}{active_tag}")
                 if overload_flags:
-                    print(f"  [WARN] 扭矩過載: {overload_flags}")
+                    _warn(f"扭矩過載: {overload_flags}")
 
             sim_t    += ctrl_dt
             step_cnt += 1
@@ -351,8 +443,10 @@ def run_zero(args, motor_ids: list, driver):
     joint_pos = np.zeros(20, dtype=np.float32)
     joint_vel = np.zeros(20, dtype=np.float32)
 
-    print(f"\n=== 零位模式（Ctrl+C 停止）{'[DRY RUN]' if args.dry_run else '[LIVE CAN]'} ===")
-    print("  ── 腿部關節安全限制 ──")
+    _banner("零位模式 — 所有馬達保持 0°")
+    _info(f"{'DRY RUN（不送指令）' if args.dry_run else 'LIVE CAN — 馬達上電中'}")
+    _info("Ctrl+C 停止")
+    _section("腿部關節安全限制")
     _print_joint_limits_table()
 
     try:
@@ -390,10 +484,72 @@ def run_zero(args, motor_ids: list, driver):
 # 模式 3：sine  — 正弦波運動（確認馬達響應，與舊版實測相同參數）
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_sine(args, motor_ids: list, driver):
-    """正弦波運動：不需要 policy 檔案，用於確認每顆馬達響應與扭矩輸出。
-    參數與舊版 test_motor_policy.py sine 模式完全一致（已實測通過）：
-      type04 ±15°, type03 ±10°, type02 ±8°, 0.3 Hz
+def run_stand(args, motor_ids: list, driver):
+    """移動到直立站姿（ZEROS）並保持。
+    測試個別關節前的標準起始點，相當於 firmware Home state 到達後的狀態。
+    """
+    ctrl_dt   = 0.02
+    step_cnt  = 0
+    id_to_idx = {mid: motor_id_to_policy_idx(mid) for mid in motor_ids}
+    joint_pos = np.zeros(20, dtype=np.float32)
+    joint_vel = np.zeros(20, dtype=np.float32)
+
+    _banner("站姿保持模式 — 移動到 ZEROS 直立站姿")
+    _info(f"{'DRY RUN（不送指令）' if args.dry_run else 'LIVE CAN — 馬達上電中'}")
+    _info("目標：ZEROS 直立站姿（膝彎 ±50°，髖 ±20°，踝 ±30°）")
+    _info("Ctrl+C 停止")
+    print("  ── 各關節目標位置 ──")
+    for mid in motor_ids:
+        name = MOTOR_CONFIG[mid]["name"]
+        tgt  = _ZEROS_DEG.get(name, 0.0)
+        print(f"    {name.replace('dof_',''):<28}  tgt={tgt:+6.1f}°")
+    print()
+
+    if driver and not args.skip_home_ramp:
+        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel)
+
+    try:
+        while True:
+            t0 = time.time()
+            if driver:
+                read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
+            if not args.dry_run and driver:
+                for mid in motor_ids:
+                    name = MOTOR_CONFIG[mid]["name"]
+                    tgt  = math.radians(_ZEROS_DEG.get(name, 0.0))
+                    send_cmd(driver, mid, tgt, MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
+
+            if step_cnt % 50 == 0:
+                print(f"[t={step_cnt*ctrl_dt:6.1f}s]")
+                for mid in motor_ids:
+                    idx   = id_to_idx[mid]
+                    cfg   = MOTOR_CONFIG[mid]
+                    name  = cfg["name"]
+                    tgt_d = _ZEROS_DEG.get(name, 0.0)
+                    cur   = math.degrees(joint_pos[idx])
+                    err   = abs(tgt_d - cur)
+                    max_t = MAX_TORQUE[cfg["type"]]
+                    torque = calc_torque(math.radians(tgt_d), joint_pos[idx],
+                                        joint_vel[idx], cfg["kp"], cfg["kd"], max_t)
+                    flag  = " !!OVERLOAD" if abs(torque) >= max_t * 0.95 else ""
+                    print(f"  {name.replace('dof_',''):<28}  cur={cur:+6.1f}°  "
+                          f"tgt={tgt_d:+6.1f}°  err={err:4.1f}°  τ={torque:6.1f}/{max_t:.0f}Nm{flag}")
+
+            step_cnt += 1
+            slp = ctrl_dt - (time.time() - t0)
+            if slp > 0:
+                time.sleep(slp)
+    except KeyboardInterrupt:
+        print("\n停止")
+
+
+def run_sine(args, motor_ids: list, active_ids: list, driver):
+    """正弦波運動（以 ZEROS 站姿為中心，非馬達機械零點）。
+    用於確認每顆馬達在站姿附近的響應與扭矩輸出：
+      type04 ±15° @ 0.3 Hz（hip pitch / knee）
+      type03 ±10° @ 0.3 Hz（hip roll / yaw）
+      type02  ±8° @ 0.3 Hz（ankle）
+    非 active_ids 的馬達保持 ZEROS 站姿位置。
     """
     ctrl_dt   = 0.02
     step_cnt  = 0
@@ -402,11 +558,33 @@ def run_sine(args, motor_ids: list, driver):
     joint_pos = np.zeros(20, dtype=np.float32)
     joint_vel = np.zeros(20, dtype=np.float32)
 
-    print(f"\n=== 正弦波模式 {SINE_FREQ_HZ} Hz（Ctrl+C 停止）"
-          f"{'[DRY RUN]' if args.dry_run else '[LIVE CAN]'} ===")
-    print(f"  振幅：type04=±15°  type03=±10°  type02=±8°")
-    print("  ── 腿部關節安全限制 ──")
-    _print_joint_limits_table()
+    # ZEROS 在 rad（sine 的中心點）
+    _zeros_rad = {mid: math.radians(_ZEROS_DEG.get(MOTOR_CONFIG[mid]["name"], 0.0))
+                  for mid in motor_ids}
+
+    active_set = set(active_ids)
+    _banner(f"正弦波模式 — {SINE_FREQ_HZ} Hz，中心=ZEROS 站姿")
+    _info(f"{'DRY RUN（不送指令）' if args.dry_run else 'LIVE CAN — 馬達上電中'}")
+    _info("振幅：type04=±15°  type03=±10°  type02=±8°")
+    _info("中心：ZEROS 站姿（不是馬達機械 0°）")
+    _info("Ctrl+C 停止")
+    if active_set != set(motor_ids):
+        active_names = [MOTOR_CONFIG[m]["name"].replace("dof_","") for m in active_ids]
+        print(f"  [限制] 只有 {active_ids} ({active_names}) 做正弦波，其餘保持 ZEROS 站姿")
+    print("\n  ── 各關節 sine 實際範圍 ──")
+    print(f"  {'關節':<26} {'ZEROS':>6} {'振幅':>6} {'最小':>8} {'最大':>8}")
+    for mid in motor_ids:
+        cfg  = MOTOR_CONFIG[mid]
+        name = cfg["name"].replace("dof_","")
+        z    = _ZEROS_DEG.get(cfg["name"], 0.0)
+        amp  = math.degrees(SINE_AMP_RAD[cfg["type"]])
+        tag  = "" if mid in active_set else " [hold]"
+        print(f"  {name:<26} {z:>+6.0f}° {amp:>+6.0f}°  {z-amp:>+7.1f}°  {z+amp:>+7.1f}°{tag}")
+
+    # 先移到站姿，再開始 sine
+    if driver and not args.skip_home_ramp:
+        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel)
+        input("\n  [確認] 已到站姿，按 Enter 開始 sine 測試...")
 
     try:
         while True:
@@ -418,8 +596,12 @@ def run_sine(args, motor_ids: list, driver):
 
             for mid in motor_ids:
                 cfg    = MOTOR_CONFIG[mid]
-                amp    = SINE_AMP_RAD[cfg["type"]]
-                target = amp * math.sin(omega * sim_t)
+                zero   = _zeros_rad[mid]
+                if mid in active_set:
+                    amp    = SINE_AMP_RAD[cfg["type"]]
+                    target = zero + amp * math.sin(omega * sim_t)  # 以 ZEROS 為中心
+                else:
+                    target = zero                                   # 非 active → 保持站姿
                 if not args.dry_run and driver:
                     send_cmd(driver, mid, target, cfg["kp"], cfg["kd"])
 
@@ -429,16 +611,21 @@ def run_sine(args, motor_ids: list, driver):
                     idx    = id_to_idx[mid]
                     cfg    = MOTOR_CONFIG[mid]
                     name   = cfg["name"].replace("dof_", "")
-                    amp    = SINE_AMP_RAD[cfg["type"]]
-                    tgt    = amp * math.sin(omega * sim_t)
+                    zero   = _zeros_rad[mid]
+                    if mid in active_set:
+                        amp = SINE_AMP_RAD[cfg["type"]]
+                        tgt = zero + amp * math.sin(omega * sim_t)
+                    else:
+                        tgt = zero
                     cur    = joint_pos[idx]
                     max_t  = MAX_TORQUE[cfg["type"]]
                     torque = calc_torque(tgt, cur, joint_vel[idx],
                                         cfg["kp"], cfg["kd"], max_t)
                     flag   = " !!OVERLOAD" if abs(torque) >= max_t * 0.95 else ""
-                    print(f"  {name:<28}  tgt={math.degrees(tgt):6.1f}°  "
-                          f"cur={math.degrees(cur):6.1f}°  "
-                          f"τ={torque:6.1f}/{max_t:.0f}Nm{flag}")
+                    tag    = "" if mid in active_set else " [hold]"
+                    print(f"  {name:<28}  tgt={math.degrees(tgt):+6.1f}°  "
+                          f"cur={math.degrees(cur):+6.1f}°  "
+                          f"τ={torque:6.1f}/{max_t:.0f}Nm{flag}{tag}")
 
             step_cnt += 1
             slp = ctrl_dt - (time.time() - t0)
@@ -460,7 +647,7 @@ def _latest_recording() -> Path | None:
     return csvs[-1] if csvs else None
 
 
-def run_replay(args, motor_ids: list, driver, bridge):
+def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
     # 選擇錄製檔
     rec_path = Path(args.recording) if args.recording else _latest_recording()
     if rec_path is None or not rec_path.exists():
@@ -473,16 +660,22 @@ def run_replay(args, motor_ids: list, driver, bridge):
                 print(f"    {p}")
         sys.exit(1)
 
-    print(f"\n=== Replay 模式 ===")
-    print(f"錄製: {rec_path}")
+    active_set = set(active_ids)
+    _banner("Replay 模式 — 從錄製 CSV 重播")
+    _info(f"錄製: {rec_path.name}")
+    _info(f"完整路徑: {rec_path}")
+    if active_set != set(motor_ids):
+        active_names = [MOTOR_CONFIG[m]["name"].replace("dof_","") for m in active_ids]
+        _warn(f"只有 {active_ids} ({active_names}) 接收錄製指令，其餘保持零位")
 
     # 載入 CSV
     with open(rec_path, newline="") as f:
         rows = list(csv.DictReader(f))
-    print(f"  共 {len(rows)} 幀，時長 {float(rows[-1]['time_s']):.2f}s")
+    _ok(f"載入 {len(rows)} 幀，時長 {float(rows[-1]['time_s']):.2f}s")
 
     # 載入 policy
-    print(f"策略: {args.policy}")
+    _section("載入策略")
+    _info(f"檔案: {Path(args.policy).name}")
     init_sess, step_sess, meta = load_kinfer(args.policy)
     num_commands = meta.get("num_commands", 0) or 0
     carry_init   = init_sess.run(None, {})
@@ -497,7 +690,8 @@ def run_replay(args, motor_ids: list, driver, bridge):
     oob_cnt  = 0    # out-of-safe-range count
     nan_cnt  = 0
 
-    print(f"\n重播中（{'DRY RUN' if args.dry_run else 'LIVE CAN'}）...\n")
+    _section(f"重播中（{'DRY RUN' if args.dry_run else 'LIVE CAN'}）")
+    print(f"  {'幀':>5}  {'時間':>6}  {'均誤差':>7}  {'超界':>4}  {'NaN':>4}  關節(cur→tgt)概覽")
 
     for row_i, row in enumerate(rows):
         t0 = time.time()
@@ -537,17 +731,26 @@ def run_replay(args, motor_ids: list, driver, bridge):
             frame_err.append(abs(pol_target - rec_target))
         errors.append(frame_err)
 
-        # 送馬達
+        # 送馬達（只有 active_ids 接收錄製 target，其餘保持零位）
         if not args.dry_run and driver:
             for mid in motor_ids:
                 idx = motor_id_to_policy_idx(mid)
-                send_cmd(driver, mid, float(clipped[idx]),
-                         MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
+                pos = float(clipped[idx]) if mid in active_set else 0.0
+                send_cmd(driver, mid, pos, MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
 
         if row_i % 50 == 0:
             mean_err = np.mean(frame_err) * 180 / math.pi
-            print(f"  [{row_i:4d}/{len(rows)}]  t={sim_t:.2f}s  "
-                  f"mean_err={mean_err:.2f}°  oob={oob_cnt}  nan={nan_cnt}")
+            # Show first 3 leg joints as quick overview: cur→tgt
+            overview_parts = []
+            for mid in motor_ids[:3]:
+                idx = motor_id_to_policy_idx(mid)
+                cur_d = math.degrees(joint_pos[idx])
+                tgt_d = math.degrees(float(clipped[idx]))
+                nm = MOTOR_CONFIG[mid]["name"].replace("dof_left_","L.").replace("dof_right_","R.")
+                overview_parts.append(f"{nm}:{cur_d:+.0f}→{tgt_d:+.0f}°")
+            print(f"  [{row_i:4d}/{len(rows)}]  t={sim_t:5.2f}s  "
+                  f"err={mean_err:5.2f}°  oob={oob_cnt:3d}  nan={nan_cnt:3d}  "
+                  + "  ".join(overview_parts))
 
         sim_t += ctrl_dt
         slp = ctrl_dt - (time.time() - t0)
@@ -556,23 +759,34 @@ def run_replay(args, motor_ids: list, driver, bridge):
 
     # ── 摘要報告 ────────────────────────────────────────────────────────────
     errors_arr = np.array(errors)   # (N_frames, 10_legs)
-    print("\n" + "=" * 60)
-    print("=== Replay 摘要報告 ===")
-    print(f"  總幀數  : {len(rows)}")
-    print(f"  NaN 幀  : {nan_cnt}  {'[FAIL]' if nan_cnt > 0 else '[OK]'}")
-    print(f"  超範圍幀: {oob_cnt}  {'[WARN]' if oob_cnt > 0 else '[OK]'}")
-    print(f"\n  policy 輸出 vs 錄製 target 偏差（deg）：")
-    print(f"  {'關節':<30}  {'均值':>6}  {'最大':>6}  {'P90':>6}")
+    _banner("Replay 摘要報告")
+    _info(f"總幀數  : {len(rows)}")
+    if nan_cnt == 0:
+        _ok(f"NaN 幀  : {nan_cnt}")
+    else:
+        _fail(f"NaN 幀  : {nan_cnt}")
+    if oob_cnt == 0:
+        _ok(f"超範圍幀: {oob_cnt}")
+    else:
+        _warn(f"超範圍幀: {oob_cnt}")
+
+    _section("policy 輸出 vs 錄製 target 偏差（deg）")
+    print(f"  {'關節':<32}  {'均值':>6}  {'最大':>6}  {'P90':>6}  狀態")
     for i, name in enumerate(RECORDING_JOINT_NAMES):
         col = errors_arr[:, i] * 180 / math.pi
-        print(f"  {name:<30}  {col.mean():6.2f}  {col.max():6.2f}  "
-              f"{np.percentile(col, 90):6.2f}")
+        status = "[OK] " if col.max() < 5.0 else "[WARN]"
+        print(f"  {name:<32}  {col.mean():6.2f}  {col.max():6.2f}  "
+              f"{np.percentile(col, 90):6.2f}  {status}")
     overall = errors_arr.flatten() * 180 / math.pi
-    print(f"\n  整體均值誤差: {overall.mean():.2f}°  最大: {overall.max():.2f}°")
+    print()
+    _info(f"整體均值誤差: {overall.mean():.2f}°  最大: {overall.max():.2f}°")
 
     passed = nan_cnt == 0 and oob_cnt == 0
-    print(f"\n  結果: {'[PASS ✓]' if passed else '[WARN 需確認]'}")
-    print("=" * 60)
+    print()
+    if passed:
+        _ok("結果: PASS ✓")
+    else:
+        _warn("結果: WARN 需確認")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -592,11 +806,13 @@ def _print_joint_limits_table():
 
 
 def run_check(args, bridge):
-    print(f"\n=== 自動檢查模式（{args.steps} 步） ===")
-    print(f"策略: {args.policy}\n")
+    _banner(f"自動檢查模式 — {args.steps} 步推論")
+    _info(f"策略: {Path(args.policy).name}")
+    imu_str = "真實 H30 IMU" if bridge else "假 IMU（直立靜止）"
+    _info(f"IMU : {imu_str}")
 
     # 印出關節安全限制表
-    print("  ── 腿部關節安全限制 ──")
+    _section("腿部關節安全限制")
     _print_joint_limits_table()
 
     init_sess, step_sess, meta = load_kinfer(args.policy)
@@ -661,9 +877,14 @@ def run_check(args, bridge):
 
         if (step + 1) % 25 == 0:
             range_ok = np.allclose(actions, clipped, atol=1e-6)
-            vals = " ".join(f"{math.degrees(float(actions[i])):5.1f}°" for i in _leg_idx[:5])
-            print(f"  step {step+1:4d}  in_range={range_ok}  "
-                  f"right_leg=[{vals}]")
+            vals = " ".join(f"{math.degrees(float(actions[i])):+5.1f}°" for i in _leg_idx[:5])
+            imu_str = ""
+            if bridge is not None:
+                with bridge._imu_lock:
+                    _pg = bridge.proj_gravity_from_quat(*bridge.IMU_STATE["quat"])
+                imu_str = (f"  pg=[{_pg[0]:+.2f} {_pg[1]:+.2f} {_pg[2]:+.2f}]")
+            range_tag = "[OK]  " if range_ok else "[WARN]"
+            print(f"  step {step+1:4d}  {range_tag}  R_leg=[{vals}]{imu_str}")
 
     # ── 每個腿部關節的 policy 輸出統計 ────────────────────────────────────────
     if history:
@@ -690,22 +911,30 @@ def run_check(args, bridge):
                   f"{lo:8.1f}  {hi:8.1f}  {status}")
 
     # ── 最終摘要 ────────────────────────────────────────────────────────────────
-    print("\n" + "=" * 56)
+    _banner("Check 摘要報告")
     passed = results["NaN/Inf"] == 0 and not results["錯誤"]
-    print(f"  策略檔    : {Path(args.policy).name}")
-    print(f"  總步數    : {results['步數']}")
-    print(f"  NaN/Inf  : {results['NaN/Inf']}  {'[FAIL]' if results['NaN/Inf'] else '[OK]'}")
-    print(f"  超安全範圍: {results['超安全範圍']}  {'[WARN]' if results['超安全範圍'] else '[OK]'}")
-    print(f"  扭矩過載  : {results['扭矩過載']}  "
-          f"{'[WARN] 有步驟達到 95% 最大扭矩' if results['扭矩過載'] else '[OK]'}")
+    _info(f"策略檔  : {Path(args.policy).name}")
+    _info(f"總步數  : {results['步數']}")
+    if results["NaN/Inf"] == 0:
+        _ok(f"NaN/Inf : {results['NaN/Inf']}")
+    else:
+        _fail(f"NaN/Inf : {results['NaN/Inf']}")
+    if results["超安全範圍"] == 0:
+        _ok(f"超安全範圍: {results['超安全範圍']}")
+    else:
+        _warn(f"超安全範圍: {results['超安全範圍']}")
+    if results["扭矩過載"] == 0:
+        _ok(f"扭矩過載  : {results['扭矩過載']}")
+    else:
+        _warn(f"扭矩過載  : {results['扭矩過載']}  （有步驟達到 95% 最大扭矩）")
     if results["錯誤"]:
-        print("  錯誤:")
         for e in results["錯誤"]:
-            print(f"    {e}")
-    imu_str = "真實 H30 IMU" if bridge else "假 IMU（直立靜止）"
-    print(f"  IMU 模式  : {imu_str}")
-    print(f"\n  結果: {'[PASS ✓]' if passed else '[FAIL ✗]'}")
-    print("=" * 56)
+            _fail(f"錯誤: {e}")
+    print()
+    if passed:
+        _ok("結果: PASS ✓")
+    else:
+        _fail("結果: FAIL ✗")
     return passed
 
 
@@ -744,7 +973,7 @@ def main():
 
     # 模式
     parser.add_argument("--mode", default="check",
-                        choices=["check", "policy", "replay", "zero", "sine"],
+                        choices=["check", "policy", "replay", "zero", "stand", "sine"],
                         help="測試模式（預設: check）")
 
     # 策略檔
@@ -758,9 +987,14 @@ def main():
     # 馬達
     parser.add_argument("--can", default="can0", help="CAN 介面（預設: can0）")
     parser.add_argument("--ids", default="31,32,33,34,35",
-                        help="馬達 CAN ID（預設: 31,32,33,34,35）")
+                        help="連接的馬達 CAN ID（預設: 31,32,33,34,35）")
+    parser.add_argument("--active-ids", default=None,
+                        help="實際送指令的馬達 ID，其餘保持零位（不指定=等同 --ids）"
+                             "  例: --active-ids 34,44 只動兩個膝關節")
     parser.add_argument("--dry-run", action="store_true",
                         help="不送 CAN 指令，只印推論結果")
+    parser.add_argument("--skip-home-ramp", action="store_true",
+                        help="跳過 Home ramp 階段（只在機器人已在初始姿態時使用）")
 
     # IMU
     parser.add_argument("--imu", action="store_true",
@@ -780,19 +1014,54 @@ def main():
     motor_ids = [int(x) for x in args.ids.split(",")]
     for mid in motor_ids:
         if mid not in MOTOR_CONFIG:
-            print(f"[ERROR] 不認識的 motor ID: {mid}（可用：{sorted(MOTOR_CONFIG.keys())}）")
+            _fail(f"不認識的 motor ID: {mid}（可用：{sorted(MOTOR_CONFIG.keys())}）")
             sys.exit(1)
+
+    # 解析 active-ids（實際送指令的子集）
+    if args.active_ids:
+        active_ids = [int(x) for x in args.active_ids.split(",")]
+        for mid in active_ids:
+            if mid not in MOTOR_CONFIG:
+                _fail(f"--active-ids 中不認識的 ID: {mid}")
+                sys.exit(1)
+            if mid not in motor_ids:
+                _fail(f"--active-ids {mid} 不在 --ids 列表中（需先連接才能啟用）")
+                sys.exit(1)
+    else:
+        active_ids = motor_ids
+
+    # ── 啟動橫幅 ──────────────────────────────────────────────────────────────
+    _banner("robot_sim2real — Pi 部署測試腳本")
+    _section("啟動設定")
+    _info(f"模式    : {args.mode.upper()}")
+    _info(f"策略    : {Path(args.policy).name}")
+    _info(f"策略路徑: {args.policy}")
+    _info(f"CAN     : {args.can}  （{'DRY RUN' if args.dry_run else 'LIVE'}）")
+    _info(f"馬達 IDs: {motor_ids}")
+    if args.active_ids:
+        _info(f"Active  : {active_ids}  （其餘保持零位）")
+    _info(f"IMU     : {'H30 USB — ' + args.imu_port if args.imu else '假 IMU（靜止直立）'}")
+    _section("馬達配置")
+    print(f"  {'ID':>3}  {'關節名稱':<28}  {'型號':>4}  {'kp':>6}  {'kd':>6}  {'最大扭矩':>8}")
+    for mid in motor_ids:
+        cfg = MOTOR_CONFIG[mid]
+        mt = MAX_TORQUE[cfg["type"]]
+        tag = " ← active" if mid in active_ids else ""
+        print(f"  {mid:>3}  {cfg['name']:<28}  {cfg['type']:>4}  "
+              f"{cfg['kp']:>6.0f}  {cfg['kd']:>6.3f}  {mt:>7.1f}Nm{tag}")
 
     # IMU
     bridge = None
     if args.imu:
+        _section("啟動 IMU")
         bridge = start_imu(args.imu_port, args.imu_baud)
 
     # 馬達驅動器（check 不需要；其他模式 dry_run 時也不建立）
     driver = None
     if not args.dry_run and args.mode not in ("check",):
-        print(f"連接 CAN: {args.can}")
+        _section(f"連接 CAN: {args.can}")
         driver = setup_driver(args.can, motor_ids)
+        _ok(f"所有馬達已啟用")
         print()
 
     try:
@@ -800,13 +1069,15 @@ def main():
             ok = run_check(args, bridge)
             sys.exit(0 if ok else 1)
         elif args.mode == "policy":
-            run_policy(args, motor_ids, driver, bridge)
+            run_policy(args, motor_ids, active_ids, driver, bridge)
         elif args.mode == "replay":
-            run_replay(args, motor_ids, driver, bridge)
+            run_replay(args, motor_ids, active_ids, driver, bridge)
         elif args.mode == "zero":
             run_zero(args, motor_ids, driver)
+        elif args.mode == "stand":
+            run_stand(args, motor_ids, driver)
         elif args.mode == "sine":
-            run_sine(args, motor_ids, driver)
+            run_sine(args, motor_ids, active_ids, driver)
     finally:
         if driver:
             print("停用馬達...")
