@@ -263,6 +263,59 @@ def run(imu_port: str, imu_baud: int, virt_port: str, virt_baud: int) -> None:
         virt_ser.close()
 
 
+def run_imu_only(imu_port: str, imu_baud: int) -> None:
+    """只讀取 H30 IMU 並更新 IMU_STATE，不需要 /dev/tnt0 虛擬串口。
+    供 test_policy.py --imu 在背景執行緒中使用。
+    """
+    imu_ser = serial.Serial(imu_port, imu_baud, timeout=0.01)
+
+    buf       = bytearray()
+    last_data: dict = {}
+
+    try:
+        while True:
+            chunk = imu_ser.read_all() or imu_ser.read(512)
+            if not chunk:
+                time.sleep(0.002)
+                continue
+
+            buf.extend(chunk)
+            pos = 0
+
+            while pos < len(buf) - PROTOCOL_MIN_LEN:
+                if buf[pos] != YIS_H1 or buf[pos + 1] != YIS_H2:
+                    pos += 1
+                    continue
+                payload_len = buf[pos + PROTOCOL_LEN_POS]
+                if pos + PROTOCOL_MIN_LEN + payload_len > len(buf):
+                    break
+                result, next_pos = _parse_yis_frame(buf, pos)
+                if result is None:
+                    pos += 1
+                    continue
+
+                last_data.update(result)
+
+                with _imu_lock:
+                    if 'acc' in result:
+                        IMU_STATE['acc'] = np.array(result['acc'], dtype=np.float64)
+                    if 'gyro' in result:
+                        IMU_STATE['gyro'] = np.array(result['gyro'], dtype=np.float64)
+                    if 'quat' in result:
+                        ew, ex, ey, ez = _ned_to_enu(*result['quat'])
+                        IMU_STATE['quat'] = np.array([ew, ex, ey, ez], dtype=np.float64)
+                    IMU_STATE['updated'] = True
+
+                pos = next_pos
+
+            buf = buf[pos:]
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        imu_ser.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="WHEELTEC H30 Mini (YESENSE) → Hiwonder 橋接器",

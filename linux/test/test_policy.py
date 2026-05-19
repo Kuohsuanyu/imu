@@ -214,7 +214,7 @@ def start_imu(imu_port: str = "/dev/ttyACM0", imu_baud: int = 460800):
     bridge = load_bridge_module()
 
     def _run():
-        bridge.run(imu_port, imu_baud, bridge.DEFAULT_VIRT_PORT, bridge.DEFAULT_VIRT_BAUD)
+        bridge.run_imu_only(imu_port, imu_baud)
 
     t = threading.Thread(target=_run, daemon=True, name="h30-bridge")
     t.start()
