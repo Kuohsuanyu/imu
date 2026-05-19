@@ -456,24 +456,25 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
                     print(f"  IMU acc=[{_acc[0]:+.3f} {_acc[1]:+.3f} {_acc[2]:+.3f}]m/s²  "
                           f"gyro=[{_gyro[0]:+.3f} {_gyro[1]:+.3f} {_gyro[2]:+.3f}]rad/s  "
                           f"pg=[{_pg[0]:+.3f} {_pg[1]:+.3f} {_pg[2]:+.3f}]")
-                print(f"  {'關節':<26}  {'cur(°)':>7}  {'tgt(°)':>7}  {'err(°)':>6}  {'τ(Nm)':>12}")
                 for mid in motor_ids:
-                    idx      = motor_id_to_policy_idx(mid)
-                    cfg      = MOTOR_CONFIG[mid]
-                    name     = cfg["name"].replace("dof_", "")
-                    cur      = math.degrees(joint_pos[idx])
-                    target   = math.degrees(actions[idx])
-                    err      = target - cur
-                    max_t    = MAX_TORQUE[cfg["type"]]
-                    torque   = calc_torque(float(actions[idx]), joint_pos[idx],
-                                          joint_vel[idx], cfg["kp"], cfg["kd"], max_t)
-                    overload = abs(torque) >= max_t * 0.95
-                    flag     = " !OVERLOAD" if overload else ""
-                    active_tag = "" if mid in set(active_ids) else " [hold]"
-                    if overload:
-                        overload_flags.append(name)
-                    print(f"  {name:<26}  {cur:>+7.1f}  {target:>+7.1f}  {err:>+6.1f}  "
-                          f"{torque:>+7.1f}/{max_t:>3.0f}Nm{flag}{active_tag}")
+                    idx    = motor_id_to_policy_idx(mid)
+                    cfg    = MOTOR_CONFIG[mid]
+                    cur    = joint_pos[idx]
+                    vel    = joint_vel[idx]
+                    tgt    = float(actions[idx])
+                    max_t  = MAX_TORQUE[cfg["type"]]
+                    torque = calc_torque(tgt, cur, vel, cfg["kp"], cfg["kd"], max_t)
+                    pct    = abs(torque) / max_t * 100
+                    over   = pct >= args.torque_limit * 100
+                    flag   = " !OVER" if over else ""
+                    hold   = "" if mid in set(active_ids) else " [hold]"
+                    if over:
+                        overload_flags.append(cfg["name"].replace("dof_", ""))
+                    print(f"  Actuator {mid:2d} (can0):"
+                          f"  pos={cur:+7.3f}rad ({math.degrees(cur):+6.1f}°)"
+                          f"  vel={vel:+6.3f}"
+                          f"  torque={torque:+7.2f}Nm ({pct:4.1f}%)"
+                          f"  tgt={tgt:+7.3f}rad ({math.degrees(tgt):+6.1f}°){flag}{hold}")
                 if overload_flags:
                     _warn(f"扭矩過載: {overload_flags}")
 
@@ -820,19 +821,23 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
                 send_cmd(driver, mid, pos, MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
 
         if row_i % 50 == 0:
-            mean_err = np.mean(frame_err) * 180 / math.pi
             max_tau  = max(frame_tau) if frame_tau else 0.0
-            over_tag = f"  [OVER {max_tau*100:.0f}%]" if max_tau > tlimit else ""
-            overview_parts = []
-            for mid in motor_ids[:3]:
-                idx = motor_id_to_policy_idx(mid)
-                cur_d = math.degrees(joint_pos[idx])
-                tgt_d = math.degrees(float(clipped[idx]))
-                nm = MOTOR_CONFIG[mid]["name"].replace("dof_left_","L.").replace("dof_right_","R.")
-                overview_parts.append(f"{nm}:{cur_d:+.0f}→{tgt_d:+.0f}°")
-            print(f"  [{row_i:4d}/{len(rows)}]  t={sim_t:5.2f}s  "
-                  f"err={mean_err:5.2f}°  τmax={max_tau*100:.0f}%  oob={oob_cnt:3d}{over_tag}  "
-                  + "  ".join(overview_parts))
+            over_tag = f" [OVER {max_tau*100:.0f}%]" if max_tau > tlimit else ""
+            print(f"\n  [frame {row_i:4d}/{len(rows)}  t={sim_t:6.2f}s  τmax={max_tau*100:.0f}%{over_tag}]")
+            for mid in motor_ids:
+                idx  = motor_id_to_policy_idx(mid)
+                cfg  = MOTOR_CONFIG[mid]
+                cur  = joint_pos[idx]
+                vel  = joint_vel[idx]
+                tgt  = float(clipped[idx])
+                tau  = calc_torque(tgt, cur, vel, cfg["kp"], cfg["kd"], MAX_TORQUE[cfg["type"]])
+                pct  = abs(tau) / MAX_TORQUE[cfg["type"]] * 100
+                flag = " !OVER" if pct >= tlimit * 100 else ""
+                print(f"  Actuator {mid:2d} (can0):"
+                      f"  pos={cur:+7.3f}rad ({math.degrees(cur):+6.1f}°)"
+                      f"  vel={vel:+6.3f}"
+                      f"  torque={tau:+7.2f}Nm ({pct:4.1f}%)"
+                      f"  tgt={tgt:+7.3f}rad ({math.degrees(tgt):+6.1f}°){flag}")
 
         sim_t += ctrl_dt
         slp = ctrl_dt - (time.time() - t0)
