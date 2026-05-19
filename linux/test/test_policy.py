@@ -178,9 +178,13 @@ def build_policy_feed(step_sess, joint_pos, joint_vel, carry, num_commands, sim_
 
     if "projected_gravity" in names:
         feed["projected_gravity"] = proj_grav
-    if "gyroscope" in names:
+    if "imu_gyro" in names:
+        feed["imu_gyro"] = gyro
+    elif "gyroscope" in names:
         feed["gyroscope"] = gyro
-    if "accelerometer" in names:
+    if "imu_acc" in names:
+        feed["imu_acc"] = acc
+    elif "accelerometer" in names:
         feed["accelerometer"] = acc
     if "time" in names:
         feed["time"] = np.array([sim_t], dtype=np.float32)
