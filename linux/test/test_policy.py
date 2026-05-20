@@ -893,21 +893,6 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
         if slp > 0:
             time.sleep(slp)
 
-    # ── Replay 結束：緩降扭矩再斷電 ─────────────────────────────────────────
-    if driver:
-        _info("緩降扭矩中（2 秒），避免斷電後突然垂下...")
-        hold_steps = 100   # 2 秒保持
-        for s in range(hold_steps):
-            ratio = 1.0 - s / hold_steps
-            read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
-            for mid in motor_ids:
-                idx = motor_id_to_policy_idx(mid)
-                cfg = MOTOR_CONFIG[mid]
-                send_cmd(driver, mid, joint_pos[idx],
-                         cfg["kp"] * ratio, cfg["kd"] * ratio)
-            time.sleep(0.02)
-        _ok("緩降完成")
-
     # ── 摘要報告 ────────────────────────────────────────────────────────────
     errors_arr = np.array(errors)   # (N_frames, 10_legs)
     _banner("Replay 摘要報告")
