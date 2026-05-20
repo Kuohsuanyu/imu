@@ -506,6 +506,16 @@ def run_zero(args, motor_ids: list, driver):
     _section("腿部關節安全限制")
     _print_joint_limits_table()
 
+    # 先緩移到零位，避免從非零位突然跳到 0°
+    if driver and not args.skip_home_ramp:
+        _warn("zero 模式：先緩移到 0°，確認機器人不會撞到東西")
+        # 臨時用 _ZEROS_DEG 全設 0 的版本做 ramp
+        _orig = dict(_ZEROS_DEG)
+        for k in _ZEROS_DEG:
+            _ZEROS_DEG[k] = 0.0
+        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, args.torque_limit)
+        _ZEROS_DEG.update(_orig)
+
     try:
         while True:
             t0 = time.time()
@@ -746,6 +756,13 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
     id_to_idx  = {mid: motor_id_to_policy_idx(mid) for mid in motor_ids}
     ctrl_dt    = 0.02
     sim_t      = 0.0
+
+    # Home ramp：讀取當前位置，緩移到站姿後再開始播放
+    if driver and not args.skip_home_ramp:
+        _ramp_pos = np.zeros(20, dtype=np.float32)
+        _ramp_vel = np.zeros(20, dtype=np.float32)
+        home_ramp(motor_ids, driver, id_to_idx, _ramp_pos, _ramp_vel, args.torque_limit)
+        input("\n  [確認] 已到達站姿，按 Enter 開始 Replay...")
 
     errors        = []   # per-leg per-frame |policy_output - recorded_target|
     torque_ratios = []   # per-leg per-frame estimated torque ratio
