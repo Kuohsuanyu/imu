@@ -371,6 +371,7 @@ def home_ramp(motor_ids: list, driver, id_to_idx: dict,
         f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:10]}≤{math.degrees(safe_steps[m]):.1f}°"
         for m in motor_ids))
 
+    MAX_RAMP_STEPS = 400   # 最多 400 步（~8s），避免讀取失敗時無限循環
     step = 0
     while True:
         t0 = time.time()
@@ -402,6 +403,10 @@ def home_ramp(motor_ids: list, driver, id_to_idx: dict,
 
         if max_err < 0.1:
             _ok(f"Home Ramp 完成：誤差 {math.degrees(max_err):.2f}°，共 {step} 步 ({step*ctrl_dt:.1f}s)，最大扭矩比 {max_torque_ratio*100:.0f}%")
+            break
+
+        if step >= MAX_RAMP_STEPS:
+            _warn(f"Home Ramp 超時（{step} 步），最大殘差 {math.degrees(max_err):.1f}°，繼續執行")
             break
 
         step += 1
