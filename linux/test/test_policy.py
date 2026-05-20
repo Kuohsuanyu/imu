@@ -293,15 +293,20 @@ def disable_all(driver, motor_ids: list):
             pass
 
 
-def read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx):
+def read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx, retries: int = 3):
     for mid in motor_ids:
         idx = id_to_idx[mid]
-        try:
-            s = driver.get_actuator_state(actuator_id=mid)
-            joint_pos[idx] = s.position
-            joint_vel[idx] = s.velocity
-        except Exception as e:
-            print(f"[WARN] 馬達 {mid} 讀取失敗: {e}")
+        for attempt in range(retries):
+            try:
+                s = driver.get_actuator_state(actuator_id=mid)
+                joint_pos[idx] = s.position
+                joint_vel[idx] = s.velocity
+                break
+            except Exception as e:
+                if attempt == retries - 1:
+                    print(f"[WARN] 馬達 {mid} 讀取失敗（{retries}次）: {e}")
+                else:
+                    time.sleep(0.002)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -365,6 +370,8 @@ def home_ramp(motor_ids: list, driver, id_to_idx: dict,
             max_torque_ratio = max(max_torque_ratio,
                                    est_torque / MAX_TORQUE[cfg["type"]])
             send_cmd(driver, mid, step_pos, cfg["kp"], cfg["kd"])
+            if len(motor_ids) > 1:
+                time.sleep(0.001)   # 多馬達時讓 CAN bus 清空再送下一顆
 
         if step % 25 == 0:
             print(f"  [{step*ctrl_dt:5.1f}s] max_err={math.degrees(max_err):.1f}°  "
