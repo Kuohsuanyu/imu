@@ -306,7 +306,26 @@ def read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx, retries: int
                 if attempt == retries - 1:
                     print(f"[WARN] 馬達 {mid} 讀取失敗（{retries}次）: {e}")
                 else:
-                    time.sleep(0.002)
+                    time.sleep(0.003)
+
+
+def send_and_read(driver, mid: int, step_pos: float, kp: float, kd: float,
+                  joint_pos: np.ndarray, joint_vel: np.ndarray, idx: int,
+                  retries: int = 3):
+    """送指令後立刻讀回同一顆馬達的狀態，避免多馬達 CAN 回應交錯。"""
+    send_cmd(driver, mid, step_pos, kp, kd)
+    time.sleep(0.003)   # 等馬達回應上 CAN bus
+    for attempt in range(retries):
+        try:
+            s = driver.get_actuator_state(actuator_id=mid)
+            joint_pos[idx] = s.position
+            joint_vel[idx] = s.velocity
+            return
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"[WARN] 馬達 {mid} 讀取失敗（{retries}次）: {e}")
+            else:
+                time.sleep(0.003)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -353,7 +372,6 @@ def home_ramp(motor_ids: list, driver, id_to_idx: dict,
     step = 0
     while True:
         t0 = time.time()
-        read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
 
         max_err = 0.0
         max_torque_ratio = 0.0
@@ -369,9 +387,9 @@ def home_ramp(motor_ids: list, driver, id_to_idx: dict,
             est_torque = cfg["kp"] * abs(step_pos - joint_pos[idx])
             max_torque_ratio = max(max_torque_ratio,
                                    est_torque / MAX_TORQUE[cfg["type"]])
-            send_cmd(driver, mid, step_pos, cfg["kp"], cfg["kd"])
-            if len(motor_ids) > 1:
-                time.sleep(0.001)   # 多馬達時讓 CAN bus 清空再送下一顆
+            # send 完立刻 read 同一顆，避免多馬達 CAN 回應交錯
+            send_and_read(driver, mid, step_pos, cfg["kp"], cfg["kd"],
+                          joint_pos, joint_vel, idx)
 
         if step % 25 == 0:
             print(f"  [{step*ctrl_dt:5.1f}s] max_err={math.degrees(max_err):.1f}°  "
