@@ -268,7 +268,9 @@ def setup_driver(can_iface: str, motor_ids: list):
         cfg   = MOTOR_CONFIG[mid]
         atype = getattr(PyRobstrideActuatorType, ACTUATOR_TYPE_MAP[cfg["type"]])
         driver.add_actuator(can_id=mid, actuator_type=atype)
+        time.sleep(0.05)
         driver.enable_actuator(actuator_id=mid)
+        time.sleep(0.05)
         _ok(f"馬達 {mid:2d} ({cfg['name']:<28}) 已啟用")
     return driver
 
