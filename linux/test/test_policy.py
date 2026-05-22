@@ -92,6 +92,9 @@ RECORDING_JOINT_NAMES = [
 _REC_TO_POL = [POLICY_JOINT_NAMES.index(n) for n in RECORDING_JOINT_NAMES]
 _LEG_INDICES = np.array(_REC_TO_POL, dtype=np.int32)  # 10 個腿部索引
 
+# ── 馬達 CAN 介面對照表（由 main() 填入，供 run_* 顯示用）──────────────────────
+_MID_CAN: dict = {}
+
 # ── CAN ID → 關節名稱、型號、PD 增益（10 腿部馬達）────────────────────────────
 MOTOR_CONFIG = {
     31: {"name": "dof_left_hip_pitch_04",  "type": "04", "kp": 150.0, "kd": 24.722},
@@ -260,34 +263,44 @@ def start_imu(imu_port: str = "/dev/ttyACM0", imu_baud: int = 460800):
 
 # ── 馬達驅動器 ─────────────────────────────────────────────────────────────────
 
-def setup_driver(can_iface: str, motor_ids: list):
+def setup_driver(can_assignment: dict) -> dict:
+    """建立馬達驅動器映射 {mid: PyRobstrideDriver}。
+    can_assignment = {mid: can_iface_str, ...}，支援多 CAN 介面（左右腿分開）。
+    """
     from robstride_driver import PyRobstrideDriver, PyRobstrideActuatorType
-    driver = PyRobstrideDriver(can_iface)
-    driver.connect(can_iface)
-    for mid in motor_ids:
+    iface_drivers: dict = {}
+    for iface in set(can_assignment.values()):
+        d = PyRobstrideDriver(iface)
+        d.connect(iface)
+        iface_drivers[iface] = d
+    driver_map: dict = {}
+    for mid in sorted(can_assignment.keys()):
+        iface = can_assignment[mid]
+        d     = iface_drivers[iface]
         cfg   = MOTOR_CONFIG[mid]
         atype = getattr(PyRobstrideActuatorType, ACTUATOR_TYPE_MAP[cfg["type"]])
-        driver.add_actuator(can_id=mid, actuator_type=atype)
+        d.add_actuator(can_id=mid, actuator_type=atype)
         time.sleep(0.05)
-        driver.enable_actuator(actuator_id=mid)
+        d.enable_actuator(actuator_id=mid)
         time.sleep(0.05)
-        _ok(f"馬達 {mid:2d} ({cfg['name']:<28}) 已啟用")
-    return driver
+        driver_map[mid] = d
+        _ok(f"馬達 {mid:2d} ({cfg['name']:<28}) 已啟用 [{iface}]")
+    return driver_map
 
 
-def send_cmd(driver, mid: int, position: float, kp: float, kd: float):
+def send_cmd(driver_map, mid: int, position: float, kp: float, kd: float):
     from robstride_driver import PyActuatorCommand
-    driver.send_command(
+    driver_map[mid].send_command(
         actuator_id=mid,
         command=PyActuatorCommand(position=position, velocity=0.0, torque=0.0, kp=kp, kd=kd),
     )
 
 
-def disable_all(driver, motor_ids: list):
+def disable_all(driver_map, motor_ids: list):
     from robstride_driver import PyActuatorCommand
     for mid in motor_ids:
         try:
-            driver.send_command(
+            driver_map[mid].send_command(
                 actuator_id=mid,
                 command=PyActuatorCommand(position=0.0, velocity=0.0, torque=0.0, kp=0.0, kd=0.0),
             )
@@ -295,12 +308,12 @@ def disable_all(driver, motor_ids: list):
             pass
 
 
-def read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx, retries: int = 3):
+def read_states(driver_map, motor_ids, joint_pos, joint_vel, id_to_idx, retries: int = 3):
     for mid in motor_ids:
         idx = id_to_idx[mid]
         for attempt in range(retries):
             try:
-                s = driver.get_actuator_state(actuator_id=mid)
+                s = driver_map[mid].get_actuator_state(actuator_id=mid)
                 joint_pos[idx] = s.position
                 joint_vel[idx] = s.velocity
                 break
@@ -311,15 +324,15 @@ def read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx, retries: int
                     time.sleep(0.003)
 
 
-def send_and_read(driver, mid: int, step_pos: float, kp: float, kd: float,
+def send_and_read(driver_map, mid: int, step_pos: float, kp: float, kd: float,
                   joint_pos: np.ndarray, joint_vel: np.ndarray, idx: int,
                   retries: int = 3):
     """送指令後立刻讀回同一顆馬達的狀態，避免多馬達 CAN 回應交錯。"""
-    send_cmd(driver, mid, step_pos, kp, kd)
+    send_cmd(driver_map, mid, step_pos, kp, kd)
     time.sleep(0.003)   # 等馬達回應上 CAN bus
     for attempt in range(retries):
         try:
-            s = driver.get_actuator_state(actuator_id=mid)
+            s = driver_map[mid].get_actuator_state(actuator_id=mid)
             joint_pos[idx] = s.position
             joint_vel[idx] = s.velocity
             return
@@ -443,7 +456,8 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
     imu_info = "真實 H30 IMU" if bridge is not None else "假 IMU（直立靜止）"
     _section(f"運行配置")
     _info(f"IMU   : {imu_info}")
-    _info(f"CAN   : {'DRY RUN（不送指令）' if args.dry_run else f'LIVE — {args.can}'}")
+    ifaces = sorted(set(_MID_CAN.get(m, args.can) for m in motor_ids))
+    _info(f"CAN   : {'DRY RUN（不送指令）' if args.dry_run else 'LIVE — ' + str(ifaces)}")
     _info(f"馬達  : {motor_ids}")
     _info(f"Active: {active_ids}")
     _section("腿部關節安全限制")
@@ -502,7 +516,7 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
                     hold   = "" if mid in set(active_ids) else " [hold]"
                     if over:
                         overload_flags.append(cfg["name"].replace("dof_", ""))
-                    print(f"  Actuator {mid:2d} (can0):"
+                    print(f"  Actuator {mid:2d} ({_MID_CAN.get(mid,'?')}):"
                           f"  pos={cur:+7.3f}rad ({math.degrees(cur):+6.1f}°)"
                           f"  vel={vel:+6.3f}"
                           f"  torque={torque:+7.2f}Nm ({pct:4.1f}%)"
@@ -882,7 +896,7 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
                 tau  = calc_torque(tgt, cur, vel, cfg["kp"], cfg["kd"], MAX_TORQUE[cfg["type"]])
                 pct  = abs(tau) / MAX_TORQUE[cfg["type"]] * 100
                 flag = " !OVER" if pct >= tlimit * 100 else ""
-                print(f"  Actuator {mid:2d} (can0):"
+                print(f"  Actuator {mid:2d} ({_MID_CAN.get(mid,'?')}):"
                       f"  pos={cur:+7.3f}rad ({math.degrees(cur):+6.1f}°)"
                       f"  vel={vel:+6.3f}"
                       f"  torque={tau:+7.2f}Nm ({pct:4.1f}%)"
@@ -1166,7 +1180,11 @@ def main():
                         help="replay 模式的 CSV 路徑（不指定則自動選最新）")
 
     # 馬達
-    parser.add_argument("--can", default="can0", help="CAN 介面（預設: can0）")
+    parser.add_argument("--can", default="can0",
+                        help="右腿 CAN 介面（預設: can0；41~45）")
+    parser.add_argument("--left-can", default=None,
+                        help="左腿 CAN 介面（預設：與 --can 相同；31~39 使用此介面，"
+                             "雙 CAN 時設為 can1）")
     parser.add_argument("--ids", default="31,32,33,34,35",
                         help="連接的馬達 CAN ID（預設: 31,32,33,34,35）")
     parser.add_argument("--active-ids", default=None,
@@ -1214,25 +1232,36 @@ def main():
     else:
         active_ids = motor_ids
 
+    # ── 建立 CAN 分配表（左腿 31~39 → left_can，右腿 41~49 → right_can）────────
+    right_can = args.can
+    left_can  = args.left_can or args.can
+    can_assignment = {}
+    for mid in motor_ids:
+        can_assignment[mid] = left_can if 31 <= mid <= 39 else right_can
+    # 填入模組級顯示表
+    _MID_CAN.update(can_assignment)
+
     # ── 啟動橫幅 ──────────────────────────────────────────────────────────────
     _banner("robot_sim2real — Pi 部署測試腳本")
     _section("啟動設定")
     _info(f"模式    : {args.mode.upper()}")
     _info(f"策略    : {Path(args.policy).name}")
     _info(f"策略路徑: {args.policy}")
-    _info(f"CAN     : {args.can}  （{'DRY RUN' if args.dry_run else 'LIVE'}）")
+    _info(f"CAN右腿 : {right_can}  （{'DRY RUN' if args.dry_run else 'LIVE'}）")
+    _info(f"CAN左腿 : {left_can}")
     _info(f"馬達 IDs: {motor_ids}")
     if args.active_ids:
         _info(f"Active  : {active_ids}  （其餘保持零位）")
     _info(f"IMU     : {'H30 USB — ' + args.imu_port if args.imu else '假 IMU（靜止直立）'}")
     _info(f"扭矩限制: {args.torque_limit*100:.0f}%  （home_ramp 步長 + replay/check 警告閾值）")
     _section("馬達配置")
-    print(f"  {'ID':>3}  {'關節名稱':<28}  {'型號':>4}  {'kp':>6}  {'kd':>6}  {'最大扭矩':>8}")
+    print(f"  {'ID':>3}  {'CAN':>4}  {'關節名稱':<28}  {'型號':>4}  {'kp':>6}  {'kd':>6}  {'最大扭矩':>8}")
     for mid in motor_ids:
-        cfg = MOTOR_CONFIG[mid]
-        mt = MAX_TORQUE[cfg["type"]]
-        tag = " ← active" if mid in active_ids else ""
-        print(f"  {mid:>3}  {cfg['name']:<28}  {cfg['type']:>4}  "
+        cfg  = MOTOR_CONFIG[mid]
+        mt   = MAX_TORQUE[cfg["type"]]
+        tag  = " ← active" if mid in active_ids else ""
+        iface = can_assignment[mid]
+        print(f"  {mid:>3}  {iface:>4}  {cfg['name']:<28}  {cfg['type']:>4}  "
               f"{cfg['kp']:>6.0f}  {cfg['kd']:>6.3f}  {mt:>7.1f}Nm{tag}")
 
     # IMU
@@ -1244,8 +1273,9 @@ def main():
     # 馬達驅動器（check 不需要；其他模式 dry_run 時也不建立）
     driver = None
     if not args.dry_run and args.mode not in ("check",):
-        _section(f"連接 CAN: {args.can}")
-        driver = setup_driver(args.can, motor_ids)
+        ifaces = sorted(set(can_assignment.values()))
+        _section(f"連接 CAN: {ifaces}")
+        driver = setup_driver(can_assignment)
         _ok(f"所有馬達已啟用")
         print()
 
