@@ -279,12 +279,19 @@ def setup_driver(can_assignment: dict) -> dict:
         d     = iface_drivers[iface]
         cfg   = MOTOR_CONFIG[mid]
         atype = getattr(PyRobstrideActuatorType, ACTUATOR_TYPE_MAP[cfg["type"]])
+        # Robstride04 needs more time to initialize reliably on CAN
+        init_delay = 0.2 if cfg["type"] == "04" else 0.05
         d.add_actuator(can_id=mid, actuator_type=atype)
-        time.sleep(0.05)
+        time.sleep(init_delay)
         d.enable_actuator(actuator_id=mid)
-        time.sleep(0.05)
+        time.sleep(init_delay)
         driver_map[mid] = d
-        _ok(f"馬達 {mid:2d} ({cfg['name']:<28}) 已啟用 [{iface}]")
+        # Verify enable succeeded by reading state
+        try:
+            s = d.get_actuator_state(actuator_id=mid)
+            _ok(f"馬達 {mid:2d} ({cfg['name']:<28}) 已啟用 [{iface}]  pos={math.degrees(s.position):+.1f}°")
+        except Exception as e:
+            _warn(f"馬達 {mid:2d} ({cfg['name']:<28}) enable 後讀取失敗: {e}")
     return driver_map
 
 
