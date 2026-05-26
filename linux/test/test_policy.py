@@ -266,6 +266,7 @@ def start_imu(imu_port: str = "/dev/ttyACM0", imu_baud: int = 460800):
 def setup_driver(can_assignment: dict) -> dict:
     """建立馬達驅動器映射 {mid: PyRobstrideDriver}。
     can_assignment = {mid: can_iface_str, ...}，支援多 CAN 介面（左右腿分開）。
+    先 add_actuator（ping 全部），再統一 enable，避免已啟用的馬達 CAN 幀干擾後續 ping。
     """
     from robstride_driver import PyRobstrideDriver, PyRobstrideActuatorType
     iface_drivers: dict = {}
@@ -274,22 +275,29 @@ def setup_driver(can_assignment: dict) -> dict:
         d.connect(iface)
         iface_drivers[iface] = d
     driver_map: dict = {}
+
+    # Phase 1: add_actuator (ping) all motors without enabling
     for mid in sorted(can_assignment.keys()):
         iface = can_assignment[mid]
         d     = iface_drivers[iface]
         cfg   = MOTOR_CONFIG[mid]
         atype = getattr(PyRobstrideActuatorType, ACTUATOR_TYPE_MAP[cfg["type"]])
-        # Robstride04 needs more time to initialize reliably on CAN
-        init_delay = 0.2 if cfg["type"] == "04" else 0.05
         d.add_actuator(can_id=mid, actuator_type=atype)
-        time.sleep(init_delay)
+        time.sleep(0.05)
+        driver_map[mid] = d
+
+    time.sleep(0.1)   # settle before enabling
+
+    # Phase 2: enable all motors, Robstride04 gets longer delay
+    for mid in sorted(can_assignment.keys()):
+        cfg  = MOTOR_CONFIG[mid]
+        d    = driver_map[mid]
+        init_delay = 0.2 if cfg["type"] == "04" else 0.05
         d.enable_actuator(actuator_id=mid)
         time.sleep(init_delay)
-        driver_map[mid] = d
-        # Verify enable succeeded by reading state
         try:
             s = d.get_actuator_state(actuator_id=mid)
-            _ok(f"馬達 {mid:2d} ({cfg['name']:<28}) 已啟用 [{iface}]  pos={math.degrees(s.position):+.1f}°")
+            _ok(f"馬達 {mid:2d} ({cfg['name']:<28}) 已啟用 [{can_assignment[mid]}]  pos={math.degrees(s.position):+.1f}°")
         except Exception as e:
             _warn(f"馬達 {mid:2d} ({cfg['name']:<28}) enable 後讀取失敗: {e}")
     return driver_map
