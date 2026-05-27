@@ -422,7 +422,9 @@ def home_ramp(motor_ids: list, driver, id_to_idx: dict,
         f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:10]}≤{math.degrees(safe_steps[m]):.1f}°"
         for m in motor_ids))
 
-    MAX_RAMP_STEPS = 400   # 最多 400 步（~8s），避免讀取失敗時無限循環
+    MAX_RAMP_STEPS = 600   # 最多 600 步（~12s）
+    RAMP_SEND_REPEAT = 5   # 每步每顆馬達連送 N 次指令，提高馬達收到的機率
+    RAMP_READ_RETRIES = 20 # 送完後最多讀取重試次數，穿越前幾幀干擾
     step = 0
     while True:
         t0 = time.time()
@@ -441,9 +443,22 @@ def home_ramp(motor_ids: list, driver, id_to_idx: dict,
             est_torque = cfg["kp"] * abs(step_pos - joint_pos[idx])
             max_torque_ratio = max(max_torque_ratio,
                                    est_torque / MAX_TORQUE[cfg["type"]])
-            # send 完立刻 read 同一顆，避免多馬達 CAN 回應交錯
-            send_and_read(driver, mid, step_pos, cfg["kp"], cfg["kd"],
-                          joint_pos, joint_vel, idx)
+
+            # 連送多次指令確保馬達收到（前幾次 CAN 幀可能被其他馬達廣播干擾）
+            for _ in range(RAMP_SEND_REPEAT):
+                send_cmd(driver, mid, step_pos, cfg["kp"], cfg["kd"])
+                time.sleep(0.002)
+
+            # 讀取重試多次，穿越前幾幀 mismatch
+            for attempt in range(RAMP_READ_RETRIES):
+                try:
+                    s = driver[mid].get_actuator_state(actuator_id=mid)
+                    joint_pos[idx] = s.position
+                    joint_vel[idx] = s.velocity
+                    break
+                except Exception:
+                    if attempt < RAMP_READ_RETRIES - 1:
+                        time.sleep(0.002)
 
         if step % 25 == 0:
             print(f"  [{step*ctrl_dt:5.1f}s] max_err={math.degrees(max_err):.1f}°  "
