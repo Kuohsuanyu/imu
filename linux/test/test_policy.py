@@ -435,56 +435,54 @@ def disable_all(driver_map, motor_ids: list):
             pass
 
 
-def _drain_until(driver, mid: int, timeout_s: float = 0.004):
-    """持續消耗 CAN buffer 中其他馬達的幀，直到拿到 mid 的幀或超時。
-    每次嘗試之間加 0.2ms 間隔，避免洗爆 CAN socket buffer (ENOBUFS)。
+_mismatch_verbose = False   # --verbose-mismatch 開啟時印每次 mismatch 詳情
+
+
+def _try_read(driver, mid: int) -> object:
+    """每個 control step 每顆馬達只嘗試讀取一次，避免多次請求洗爆 CAN bus。
+    成功回傳 state 物件，失敗回傳 None。
     """
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            return driver.get_actuator_state(actuator_id=mid)
-        except Exception as e:
-            msg = str(e)
-            if "mismatch" in msg.lower():
-                _record_fail(mid, e)
-                time.sleep(0.0002)   # 200µs 讓 buffer 喘息
-                continue
-            if "buffer" in msg.lower() or "105" in msg:
-                # ENOBUFS：buffer 已滿，等久一點再試
-                time.sleep(0.001)
-                continue
-            raise   # 其他真實錯誤才往上拋
-    return None   # 超時，用上次的值
+    try:
+        s = driver.get_actuator_state(actuator_id=mid)
+        _record_ok(mid)
+        return s
+    except Exception as e:
+        msg = str(e)
+        _record_fail(mid, e)
+        if _mismatch_verbose:
+            err_type = "mismatch" if "mismatch" in msg.lower() else \
+                       "ENOBUFS"  if ("buffer" in msg.lower() or "105" in msg) else "other"
+            st = _stats(mid)
+            print(f"  [MISMATCH] mid={mid:2d}  type={err_type}  "
+                  f"consec={st['consec_fail']}  "
+                  f"ok={st['ok']}  miss={st['mismatch']}  "
+                  f"err={msg!r}")
+        elif _stats(mid)["consec_fail"] % 50 == 0 and _stats(mid)["consec_fail"] > 0:
+            st = _stats(mid)
+            print(f"[WARN] 馬達 {mid} 連續失敗 {st['consec_fail']} 次  "
+                  f"(ok={st['ok']} miss={st['mismatch']} err={msg!r})")
+        return None
 
 
 def read_states(driver_map, motor_ids, joint_pos, joint_vel, id_to_idx, retries: int = 3):
     for mid in motor_ids:
         idx = id_to_idx[mid]
-        s = _drain_until(driver_map[mid], mid)
+        s   = _try_read(driver_map[mid], mid)
         if s is not None:
             joint_pos[idx] = s.position
             joint_vel[idx] = s.velocity
-            _record_ok(mid)
-        else:
-            s_info = _stats(mid)
-            if s_info["consec_fail"] % 10 == 0:   # 每 10 次才印一次，避免洗版
-                print(f"[WARN] 馬達 {mid} 讀取逾時（連續={s_info['consec_fail']}）")
 
 
 def send_and_read(driver_map, mid: int, step_pos: float, kp: float, kd: float,
                   joint_pos: np.ndarray, joint_vel: np.ndarray, idx: int,
                   retries: int = 3):
-    """送指令後消耗 CAN buffer 直到拿到同一顆馬達的回應幀。"""
+    """送指令後讀一次回應（不重試，避免多次請求洗爆 CAN bus）。"""
     send_cmd(driver_map, mid, step_pos, kp, kd)
-    s = _drain_until(driver_map[mid], mid, timeout_s=0.003)
+    time.sleep(0.001)   # 1ms 等馬達回應幀上 bus
+    s = _try_read(driver_map[mid], mid)
     if s is not None:
         joint_pos[idx] = s.position
         joint_vel[idx] = s.velocity
-        _record_ok(mid)
-    else:
-        s_info = _stats(mid)
-        if s_info["consec_fail"] % 10 == 0:
-            print(f"[WARN] 馬達 {mid} 讀取逾時（連續={s_info['consec_fail']}）")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1359,6 +1357,8 @@ def main():
                              "（用於確認錄製動作本身的安全性，排除 model 版本差異影響）")
     parser.add_argument("--skip-home-ramp", action="store_true",
                         help="跳過 Home ramp 階段（只在機器人已在初始姿態時使用）")
+    parser.add_argument("--verbose-mismatch", action="store_true",
+                        help="印出每次 CAN ID mismatch 的詳細資訊（用於診斷）")
 
     # IMU
     parser.add_argument("--imu", action="store_true",
@@ -1393,6 +1393,9 @@ def main():
                 sys.exit(1)
     else:
         active_ids = motor_ids
+
+    global _mismatch_verbose
+    _mismatch_verbose = args.verbose_mismatch
 
     # ── 建立 CAN 分配表（左腿 31~39 → left_can，右腿 41~49 → right_can）────────
     right_can = args.can
