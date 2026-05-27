@@ -263,31 +263,18 @@ def start_imu(imu_port: str = "/dev/ttyACM0", imu_baud: int = 460800):
 
 # ── 馬達驅動器 ─────────────────────────────────────────────────────────────────
 
-def _enable_and_verify(d, mid: int, cfg: dict, iface: str,
-                       attempts: int, delay: float) -> bool:
-    """對單顆馬達重複 enable+verify，成功回傳 True。"""
-    for attempt in range(1, attempts + 1):
-        print(f"    馬達 {mid:2d} ({cfg['name']:<28}) [{iface}] "
-              f"嘗試 {attempt}/{attempts} ...", end=" ", flush=True)
-        try:
-            d.enable_actuator(actuator_id=mid)
-            time.sleep(delay)
-            s = d.get_actuator_state(actuator_id=mid)
-            print(f"OK  pos={math.degrees(s.position):+.1f}°")
-            return True
-        except Exception as e:
-            print(f"失敗: {e}")
-            time.sleep(0.15)
-    return False
-
-
 def setup_driver(can_assignment: dict) -> dict:
     """建立馬達驅動器映射。
-    - Robstride04：10 次嘗試，每次等 300ms（初始化較慢）
-    - Robstride03/02：5 次嘗試，每次等 100ms
-    失敗的馬達會列出，並互動詢問是否對特定馬達重試。
+
+    Phase 1: ping 全部馬達
+    Phase 2: enable 全部馬達（04 送 3 次確保收到）
+    Phase 3: 背景持續發送保持指令，讓你摸馬達確認鎖住。
+             輸入已確認的 ID → 從待確認清單移除。
+             r ID → 對指定馬達重新 enable。
+             Enter → 全部跳過繼續。q → 中止。
     """
-    from robstride_driver import PyRobstrideDriver, PyRobstrideActuatorType
+    import threading
+    from robstride_driver import PyRobstrideDriver, PyRobstrideActuatorType, PyActuatorCommand
 
     iface_drivers: dict = {}
     for iface in set(can_assignment.values()):
@@ -297,7 +284,7 @@ def setup_driver(can_assignment: dict) -> dict:
 
     driver_map: dict = {}
 
-    # Phase 1: ping 全部馬達（不啟用）
+    # Phase 1: ping
     print(f"\n  [Phase 1] Ping 全部馬達")
     for mid in sorted(can_assignment.keys()):
         iface = can_assignment[mid]
@@ -307,75 +294,107 @@ def setup_driver(can_assignment: dict) -> dict:
         d.add_actuator(can_id=mid, actuator_type=atype)
         time.sleep(0.05)
         driver_map[mid] = d
+        print(f"    ping 馬達 {mid:2d} ({cfg['name']:<28}) [{iface}]")
     time.sleep(0.15)
 
-    # Phase 2: enable+verify，04 馬達給更多次數與更長等待
-    print(f"\n  [Phase 2] Enable 並確認（04馬達10次/300ms，其他5次/100ms）")
-    failed: list = []
+    # Phase 2: enable（04 重送 3 次）
+    print(f"\n  [Phase 2] Enable 全部馬達")
     for mid in sorted(can_assignment.keys()):
-        cfg   = MOTOR_CONFIG[mid]
-        d     = driver_map[mid]
-        iface = can_assignment[mid]
-        if cfg["type"] == "04":
-            ok = _enable_and_verify(d, mid, cfg, iface, attempts=10, delay=0.30)
-        else:
-            ok = _enable_and_verify(d, mid, cfg, iface, attempts=5,  delay=0.10)
-        if not ok:
-            failed.append(mid)
+        cfg    = MOTOR_CONFIG[mid]
+        d      = driver_map[mid]
+        repeat = 3 if cfg["type"] == "04" else 1
+        for _ in range(repeat):
+            try:
+                d.enable_actuator(actuator_id=mid)
+            except Exception:
+                pass
+            time.sleep(0.1 if cfg["type"] == "04" else 0.05)
+        print(f"    enable 馬達 {mid:2d} ({cfg['name']:<28})")
+    time.sleep(0.3)
 
-    # Phase 3: 顯示結果，讓使用者決定是否重試特定馬達
-    while True:
-        if not failed:
-            _ok("所有馬達確認連線完成")
-            break
+    # Phase 3: 背景發送 + 互動確認
+    print(f"\n  [Phase 3] 持續送指令 — 摸馬達確認鎖住後輸入 ID")
+    print(f"  格式：")
+    print(f"    31,34       → 確認這些馬達已鎖住")
+    print(f"    r 31,34     → 對指定馬達重新 enable")
+    print(f"    Enter       → 全部跳過，直接繼續")
+    print(f"    q           → 中止程式")
+    print()
 
-        print()
-        _warn("以下馬達未能確認連線：")
-        for mid in failed:
-            cfg = MOTOR_CONFIG[mid]
-            print(f"    ✗ 馬達 {mid:2d}  {cfg['name']}  [{can_assignment[mid]}]  type={cfg['type']}")
+    pending   = sorted(can_assignment.keys())
+    confirmed: list = []
 
-        print()
-        print("  輸入要重試的馬達 ID（逗號分隔，例: 31,34），或直接 Enter 繼續，或 q 中止程式：")
-        try:
-            ans = input("  > ").strip()
-        except EOFError:
-            ans = ""
+    def _send_loop(stop_event):
+        while not stop_event.is_set():
+            for mid in sorted(can_assignment.keys()):
+                cfg = MOTOR_CONFIG[mid]
+                try:
+                    driver_map[mid].send_command(
+                        actuator_id=mid,
+                        command=PyActuatorCommand(
+                            position=0.0, velocity=0.0, torque=0.0,
+                            kp=cfg["kp"], kd=cfg["kd"]),
+                    )
+                except Exception:
+                    pass
+            time.sleep(0.02)
 
-        if ans.lower() == "q":
-            raise SystemExit("使用者中止")
-        if not ans:
-            _warn(f"跳過未確認馬達 {failed}，繼續啟動（部分馬達可能無回應）")
-            break
+    stop_evt = threading.Event()
+    threading.Thread(target=_send_loop, args=(stop_evt,), daemon=True).start()
 
-        retry_ids = []
-        for tok in ans.split(","):
-            tok = tok.strip()
-            if tok.isdigit() and int(tok) in failed:
-                retry_ids.append(int(tok))
-            elif tok:
-                print(f"  [忽略] {tok!r} 不在失敗清單中")
+    try:
+        while pending:
+            print(f"  待確認: {pending}")
+            print(f"  已確認: {confirmed}")
+            print("  > ", end="", flush=True)
+            try:
+                ans = input().strip()
+            except EOFError:
+                ans = ""
 
-        if not retry_ids:
-            continue
+            if ans.lower() == "q":
+                stop_evt.set()
+                raise SystemExit("使用者中止")
 
-        print(f"\n  [重試] {retry_ids}")
-        still_failed = []
-        for mid in retry_ids:
-            cfg   = MOTOR_CONFIG[mid]
-            d     = driver_map[mid]
-            iface = can_assignment[mid]
-            if cfg["type"] == "04":
-                ok = _enable_and_verify(d, mid, cfg, iface, attempts=10, delay=0.30)
-            else:
-                ok = _enable_and_verify(d, mid, cfg, iface, attempts=5,  delay=0.10)
-            if ok:
-                failed.remove(mid)
-            else:
-                still_failed.append(mid)
+            if not ans:
+                _warn(f"跳過 {pending}，繼續啟動")
+                confirmed.extend(pending)
+                pending.clear()
+                break
 
-        if still_failed:
-            _warn(f"重試後仍失敗: {still_failed}")
+            # r ID：重新 enable
+            if ans.lower().startswith("r "):
+                for tok in ans[2:].split(","):
+                    tok = tok.strip()
+                    if tok.isdigit():
+                        mid = int(tok)
+                        cfg = MOTOR_CONFIG.get(mid)
+                        if cfg:
+                            repeat = 3 if cfg["type"] == "04" else 1
+                            for _ in range(repeat):
+                                try:
+                                    driver_map[mid].enable_actuator(actuator_id=mid)
+                                except Exception:
+                                    pass
+                                time.sleep(0.1)
+                            print(f"    重新 enable 馬達 {mid}")
+                continue
+
+            # ID：標記確認
+            for tok in ans.split(","):
+                tok = tok.strip()
+                if tok.isdigit():
+                    mid = int(tok)
+                    if mid in pending:
+                        pending.remove(mid)
+                        confirmed.append(mid)
+                        _ok(f"馬達 {mid:2d} ({MOTOR_CONFIG[mid]['name']}) 確認鎖住")
+                    else:
+                        print(f"    [忽略] {mid} 不在待確認清單")
+
+        _ok(f"確認完成: {sorted(confirmed)}")
+    finally:
+        stop_evt.set()
 
     return driver_map
 
