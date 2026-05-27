@@ -263,20 +263,22 @@ def start_imu(imu_port: str = "/dev/ttyACM0", imu_baud: int = 460800):
 
 # ── 馬達驅動器 ─────────────────────────────────────────────────────────────────
 
-def setup_driver(can_assignment: dict) -> dict:
-    """建立馬達驅動器映射 {mid: PyRobstrideDriver}。
-    can_assignment = {mid: can_iface_str, ...}，支援多 CAN 介面（左右腿分開）。
-    先 add_actuator（ping 全部），再統一 enable，避免已啟用的馬達 CAN 幀干擾後續 ping。
+def setup_driver(can_assignment: dict, max_attempts: int = 5) -> dict:
+    """建立馬達驅動器映射，對每顆馬達重複嘗試直到確認讀到狀態才繼續。
+    max_attempts：每顆馬達最多嘗試幾輪 ping+enable+verify（預設 5 輪）。
     """
     from robstride_driver import PyRobstrideDriver, PyRobstrideActuatorType
+
     iface_drivers: dict = {}
     for iface in set(can_assignment.values()):
         d = PyRobstrideDriver(iface)
         d.connect(iface)
         iface_drivers[iface] = d
+
     driver_map: dict = {}
 
-    # Phase 1: add_actuator (ping) all motors without enabling
+    # Phase 1: ping 全部馬達（不啟用）
+    print(f"\n  [Phase 1] Ping 全部馬達")
     for mid in sorted(can_assignment.keys()):
         iface = can_assignment[mid]
         d     = iface_drivers[iface]
@@ -286,20 +288,41 @@ def setup_driver(can_assignment: dict) -> dict:
         time.sleep(0.05)
         driver_map[mid] = d
 
-    time.sleep(0.1)   # settle before enabling
+    time.sleep(0.1)
 
-    # Phase 2: enable all motors, Robstride04 gets longer delay
+    # Phase 2: 對每顆馬達重複 enable+verify，直到成功讀到位置才繼續
+    print(f"\n  [Phase 2] Enable 並確認每顆馬達（最多 {max_attempts} 次）")
+    failed = []
     for mid in sorted(can_assignment.keys()):
-        cfg  = MOTOR_CONFIG[mid]
-        d    = driver_map[mid]
-        init_delay = 0.2 if cfg["type"] == "04" else 0.05
-        d.enable_actuator(actuator_id=mid)
-        time.sleep(init_delay)
-        try:
-            s = d.get_actuator_state(actuator_id=mid)
-            _ok(f"馬達 {mid:2d} ({cfg['name']:<28}) 已啟用 [{can_assignment[mid]}]  pos={math.degrees(s.position):+.1f}°")
-        except Exception as e:
-            _warn(f"馬達 {mid:2d} ({cfg['name']:<28}) enable 後讀取失敗: {e}")
+        cfg        = MOTOR_CONFIG[mid]
+        d          = driver_map[mid]
+        init_delay = 0.2 if cfg["type"] == "04" else 0.1
+        verified   = False
+
+        for attempt in range(1, max_attempts + 1):
+            print(f"    馬達 {mid:2d} ({cfg['name']:<28}) 嘗試 {attempt}/{max_attempts} ...",
+                  end=" ", flush=True)
+            try:
+                d.enable_actuator(actuator_id=mid)
+                time.sleep(init_delay)
+                s = d.get_actuator_state(actuator_id=mid)
+                print(f"OK  pos={math.degrees(s.position):+.1f}°")
+                _ok(f"馬達 {mid:2d} 已確認 [{can_assignment[mid]}]  pos={math.degrees(s.position):+.1f}°")
+                verified = True
+                break
+            except Exception as e:
+                print(f"失敗: {e}")
+                time.sleep(0.2)   # 等一下再重試
+
+        if not verified:
+            _warn(f"馬達 {mid:2d} ({cfg['name']}) {max_attempts} 次後仍無回應，繼續啟動")
+            failed.append(mid)
+
+    if failed:
+        _warn(f"以下馬達未能確認連線: {failed}")
+    else:
+        _ok("所有馬達確認連線完成")
+
     return driver_map
 
 
