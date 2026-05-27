@@ -261,52 +261,6 @@ def start_imu(imu_port: str = "/dev/ttyACM0", imu_baud: int = 460800):
     return bridge
 
 
-# ── 馬達診斷追蹤（per-motor 失敗統計）────────────────────────────────────────
-
-_motor_stats: dict = {}   # mid → {"ok": int, "mismatch": int, "other": int, "consec_fail": int}
-
-def _stats(mid: int) -> dict:
-    if mid not in _motor_stats:
-        _motor_stats[mid] = {"ok": 0, "mismatch": 0, "other": 0, "consec_fail": 0}
-    return _motor_stats[mid]
-
-def _record_ok(mid: int):
-    s = _stats(mid)
-    s["ok"] += 1
-    s["consec_fail"] = 0
-
-def _record_fail(mid: int, e: Exception):
-    s   = _stats(mid)
-    msg = str(e)
-    if "mismatch" in msg.lower():
-        s["mismatch"] += 1
-    else:
-        s["other"] += 1
-    s["consec_fail"] += 1
-    return msg
-
-def print_motor_health(motor_ids: list, label: str = ""):
-    """印出每顆馬達的讀取成功/失敗統計。"""
-    tag = f"  [{label}] " if label else "  "
-    print(f"\n{tag}── 馬達健康報告 ──")
-    print(f"  {'ID':>3}  {'名稱':<24}  {'成功':>6}  {'mismatch':>9}  {'其他錯誤':>9}  {'連續失敗':>9}  狀態")
-    for mid in motor_ids:
-        s    = _stats(mid)
-        cfg  = MOTOR_CONFIG[mid]
-        name = cfg["name"].replace("dof_", "")
-        total = s["ok"] + s["mismatch"] + s["other"]
-        ok_pct = s["ok"] / total * 100 if total else 0
-        if s["consec_fail"] >= 10:
-            status = "!! 疑似斷線"
-        elif ok_pct < 50 and total > 10:
-            status = "⚠  不穩定"
-        else:
-            status = "OK"
-        print(f"  {mid:>3}  {name:<24}  {s['ok']:>6}  {s['mismatch']:>9}  {s['other']:>9}  "
-              f"{s['consec_fail']:>9}  {status}")
-    print()
-
-
 # ── 馬達驅動器 ─────────────────────────────────────────────────────────────────
 
 def setup_driver(can_assignment: dict) -> dict:
@@ -317,101 +271,35 @@ def setup_driver(can_assignment: dict) -> dict:
     from robstride_driver import PyRobstrideDriver, PyRobstrideActuatorType
     iface_drivers: dict = {}
     for iface in set(can_assignment.values()):
-        print(f"  [CAN] 開啟介面 {iface} ...")
-        try:
-            d = PyRobstrideDriver(iface)
-            d.connect(iface)
-            iface_drivers[iface] = d
-            _ok(f"CAN 介面 {iface} 連接成功")
-        except Exception as e:
-            _fail(f"CAN 介面 {iface} 連接失敗: {e!r}")
-            raise
+        d = PyRobstrideDriver(iface)
+        d.connect(iface)
+        iface_drivers[iface] = d
     driver_map: dict = {}
 
     # Phase 1: add_actuator (ping) all motors without enabling
-    print(f"\n  [Phase 1] Ping 全部馬達（不啟用）")
-    ping_failed = []
     for mid in sorted(can_assignment.keys()):
         iface = can_assignment[mid]
         d     = iface_drivers[iface]
         cfg   = MOTOR_CONFIG[mid]
         atype = getattr(PyRobstrideActuatorType, ACTUATOR_TYPE_MAP[cfg["type"]])
-        print(f"    ping 馬達 {mid:2d} ({cfg['name']:<28}) [{iface}] type={cfg['type']} ...", end=" ", flush=True)
-        try:
-            d.add_actuator(can_id=mid, actuator_type=atype)
-            print("OK")
-        except Exception as e:
-            print(f"FAIL: {e!r}")
-            ping_failed.append(mid)
+        d.add_actuator(can_id=mid, actuator_type=atype)
         time.sleep(0.05)
         driver_map[mid] = d
-
-    if ping_failed:
-        _warn(f"Phase 1 ping 失敗的馬達: {ping_failed}")
-    else:
-        _ok(f"Phase 1 完成：所有 {len(driver_map)} 顆馬達 ping 成功")
 
     time.sleep(0.1)   # settle before enabling
 
     # Phase 2: enable all motors, Robstride04 gets longer delay
-    print(f"\n  [Phase 2] 啟用全部馬達")
-    enable_failed = []
     for mid in sorted(can_assignment.keys()):
-        cfg        = MOTOR_CONFIG[mid]
-        d          = driver_map[mid]
+        cfg  = MOTOR_CONFIG[mid]
+        d    = driver_map[mid]
         init_delay = 0.2 if cfg["type"] == "04" else 0.05
-        print(f"    enable 馬達 {mid:2d} ({cfg['name']:<28}) [{can_assignment[mid]}] ...", end=" ", flush=True)
-        try:
-            d.enable_actuator(actuator_id=mid)
-            print(f"OK (等 {init_delay*1000:.0f}ms)", end=" ", flush=True)
-        except Exception as e:
-            print(f"FAIL: {e!r}")
-            enable_failed.append(mid)
-            time.sleep(init_delay)
-            continue
+        d.enable_actuator(actuator_id=mid)
         time.sleep(init_delay)
-        # 啟用後立刻讀取狀態確認
-        for attempt in range(3):
-            try:
-                s = d.get_actuator_state(actuator_id=mid)
-                print(f"→ pos={math.degrees(s.position):+.1f}°  vel={s.velocity:+.3f}  "
-                      f"temp={s.temperature:.0f}°C  faults=0x{getattr(s,'fault_code', 0):04X}")
-                _record_ok(mid)
-                break
-            except Exception as e:
-                msg = str(e)
-                if attempt == 2:
-                    print(f"\n    [WARN] 讀取失敗({attempt+1}/3): {msg!r}")
-                    _record_fail(mid, e)
-                else:
-                    time.sleep(0.01)
-
-    if enable_failed:
-        _warn(f"Phase 2 enable 失敗的馬達: {enable_failed}")
-    else:
-        _ok(f"Phase 2 完成：所有馬達已啟用")
-
-    # Phase 3: 啟用後等待 0.3s，再做一次全體狀態確認
-    print(f"\n  [Phase 3] 啟用後穩定確認（等 300ms）")
-    time.sleep(0.3)
-    all_ok = True
-    for mid in sorted(can_assignment.keys()):
-        cfg = MOTOR_CONFIG[mid]
-        d   = driver_map[mid]
         try:
             s = d.get_actuator_state(actuator_id=mid)
-            fault = getattr(s, 'fault_code', 0)
-            fault_tag = f"  ⚠ faults=0x{fault:04X}" if fault else ""
-            _ok(f"馬達 {mid:2d} ({cfg['name']:<28}) [{can_assignment[mid]}]  "
-                f"pos={math.degrees(s.position):+.1f}°  temp={s.temperature:.0f}°C{fault_tag}")
-            _record_ok(mid)
+            _ok(f"馬達 {mid:2d} ({cfg['name']:<28}) 已啟用 [{can_assignment[mid]}]  pos={math.degrees(s.position):+.1f}°")
         except Exception as e:
-            _warn(f"馬達 {mid:2d} ({cfg['name']:<28}) 最終確認失敗: {e!r}")
-            _record_fail(mid, e)
-            all_ok = False
-
-    if not all_ok:
-        _warn("部分馬達最終確認失敗，後續指令可能不穩定")
+            _warn(f"馬達 {mid:2d} ({cfg['name']:<28}) enable 後讀取失敗: {e}")
     return driver_map
 
 
@@ -435,54 +323,39 @@ def disable_all(driver_map, motor_ids: list):
             pass
 
 
-_mismatch_verbose = False   # --verbose-mismatch 開啟時印每次 mismatch 詳情
-
-
-def _try_read(driver, mid: int) -> object:
-    """每個 control step 每顆馬達只嘗試讀取一次，避免多次請求洗爆 CAN bus。
-    成功回傳 state 物件，失敗回傳 None。
-    """
-    try:
-        s = driver.get_actuator_state(actuator_id=mid)
-        _record_ok(mid)
-        return s
-    except Exception as e:
-        msg = str(e)
-        _record_fail(mid, e)
-        if _mismatch_verbose:
-            err_type = "mismatch" if "mismatch" in msg.lower() else \
-                       "ENOBUFS"  if ("buffer" in msg.lower() or "105" in msg) else "other"
-            st = _stats(mid)
-            print(f"  [MISMATCH] mid={mid:2d}  type={err_type}  "
-                  f"consec={st['consec_fail']}  "
-                  f"ok={st['ok']}  miss={st['mismatch']}  "
-                  f"err={msg!r}")
-        elif _stats(mid)["consec_fail"] % 50 == 0 and _stats(mid)["consec_fail"] > 0:
-            st = _stats(mid)
-            print(f"[WARN] 馬達 {mid} 連續失敗 {st['consec_fail']} 次  "
-                  f"(ok={st['ok']} miss={st['mismatch']} err={msg!r})")
-        return None
-
-
 def read_states(driver_map, motor_ids, joint_pos, joint_vel, id_to_idx, retries: int = 3):
     for mid in motor_ids:
         idx = id_to_idx[mid]
-        s   = _try_read(driver_map[mid], mid)
-        if s is not None:
-            joint_pos[idx] = s.position
-            joint_vel[idx] = s.velocity
+        for attempt in range(retries):
+            try:
+                s = driver_map[mid].get_actuator_state(actuator_id=mid)
+                joint_pos[idx] = s.position
+                joint_vel[idx] = s.velocity
+                break
+            except Exception as e:
+                if attempt == retries - 1:
+                    print(f"[WARN] 馬達 {mid} 讀取失敗（{retries}次）: {e}")
+                else:
+                    time.sleep(0.003)
 
 
 def send_and_read(driver_map, mid: int, step_pos: float, kp: float, kd: float,
                   joint_pos: np.ndarray, joint_vel: np.ndarray, idx: int,
                   retries: int = 3):
-    """送指令後讀一次回應（不重試，避免多次請求洗爆 CAN bus）。"""
+    """送指令後立刻讀回同一顆馬達的狀態，避免多馬達 CAN 回應交錯。"""
     send_cmd(driver_map, mid, step_pos, kp, kd)
-    time.sleep(0.001)   # 1ms 等馬達回應幀上 bus
-    s = _try_read(driver_map[mid], mid)
-    if s is not None:
-        joint_pos[idx] = s.position
-        joint_vel[idx] = s.velocity
+    time.sleep(0.003)   # 等馬達回應上 CAN bus
+    for attempt in range(retries):
+        try:
+            s = driver_map[mid].get_actuator_state(actuator_id=mid)
+            joint_pos[idx] = s.position
+            joint_vel[idx] = s.velocity
+            return
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"[WARN] 馬達 {mid} 讀取失敗（{retries}次）: {e}")
+            else:
+                time.sleep(0.003)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -666,10 +539,6 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
                 if overload_flags:
                     _warn(f"扭矩過載: {overload_flags}")
 
-            # 每 100 步印健康摘要
-            if step_cnt % 100 == 99 and driver:
-                print_motor_health(motor_ids, f"t={sim_t:.0f}s")
-
             sim_t    += ctrl_dt
             step_cnt += 1
             slp = ctrl_dt - (time.time() - t0)
@@ -678,8 +547,6 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
 
     except KeyboardInterrupt:
         print("\n停止")
-        if driver:
-            print_motor_health(motor_ids, "最終統計")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -852,22 +719,19 @@ def run_sine(args, motor_ids: list, active_ids: list, driver):
             t0    = time.time()
             sim_t = step_cnt * ctrl_dt
 
+            if driver:
+                read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
+
             for mid in motor_ids:
                 cfg    = MOTOR_CONFIG[mid]
                 zero   = _zeros_rad[mid]
-                idx    = id_to_idx[mid]
                 if mid in active_set:
                     amp    = SINE_AMP_RAD[cfg["type"]]
-                    target = zero + amp * math.sin(omega * sim_t)
+                    target = zero + amp * math.sin(omega * sim_t)  # 以 ZEROS 為中心
                 else:
-                    target = zero
+                    target = zero                                   # 非 active → 保持站姿
                 if not args.dry_run and driver:
-                    # send_and_read：送指令後馬達立刻回應，比周期廣播幀優先到達
-                    send_and_read(driver, mid, target, cfg["kp"], cfg["kd"],
-                                  joint_pos, joint_vel, idx)
-                elif driver:
-                    # dry_run：只讀不送
-                    read_states(driver, [mid], joint_pos, joint_vel, id_to_idx)
+                    send_cmd(driver, mid, target, cfg["kp"], cfg["kd"])
 
             if step_cnt % 50 == 0:
                 print(f"[t={sim_t:6.1f}s]")
@@ -887,16 +751,9 @@ def run_sine(args, motor_ids: list, active_ids: list, driver):
                                         cfg["kp"], cfg["kd"], max_t)
                     flag   = " !!OVERLOAD" if abs(torque) >= max_t * 0.95 else ""
                     tag    = "" if mid in active_set else " [hold]"
-                    st     = _stats(mid)
-                    ok_pct = (st["ok"] / max(1, st["ok"] + st["mismatch"] + st["other"])) * 100
                     print(f"  {name:<28}  tgt={math.degrees(tgt):+6.1f}°  "
                           f"cur={math.degrees(cur):+6.1f}°  "
-                          f"τ={torque:6.1f}/{max_t:.0f}Nm  "
-                          f"ok={ok_pct:.0f}% cf={st['consec_fail']}{flag}{tag}")
-
-            # 每 100 步（2s）印一次健康摘要
-            if step_cnt % 100 == 99 and driver:
-                print_motor_health(motor_ids, f"t={sim_t:.0f}s")
+                          f"τ={torque:6.1f}/{max_t:.0f}Nm{flag}{tag}")
 
             step_cnt += 1
             slp = ctrl_dt - (time.time() - t0)
@@ -904,8 +761,6 @@ def run_sine(args, motor_ids: list, active_ids: list, driver):
                 time.sleep(slp)
     except KeyboardInterrupt:
         print("\n停止")
-        if driver:
-            print_motor_health(motor_ids, "最終統計")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1357,8 +1212,6 @@ def main():
                              "（用於確認錄製動作本身的安全性，排除 model 版本差異影響）")
     parser.add_argument("--skip-home-ramp", action="store_true",
                         help="跳過 Home ramp 階段（只在機器人已在初始姿態時使用）")
-    parser.add_argument("--verbose-mismatch", action="store_true",
-                        help="印出每次 CAN ID mismatch 的詳細資訊（用於診斷）")
 
     # IMU
     parser.add_argument("--imu", action="store_true",
@@ -1393,9 +1246,6 @@ def main():
                 sys.exit(1)
     else:
         active_ids = motor_ids
-
-    global _mismatch_verbose
-    _mismatch_verbose = args.verbose_mismatch
 
     # ── 建立 CAN 分配表（左腿 31~39 → left_can，右腿 41~49 → right_can）────────
     right_can = args.can
