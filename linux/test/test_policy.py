@@ -843,19 +843,22 @@ def run_sine(args, motor_ids: list, active_ids: list, driver):
             t0    = time.time()
             sim_t = step_cnt * ctrl_dt
 
-            if driver:
-                read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
-
             for mid in motor_ids:
                 cfg    = MOTOR_CONFIG[mid]
                 zero   = _zeros_rad[mid]
+                idx    = id_to_idx[mid]
                 if mid in active_set:
                     amp    = SINE_AMP_RAD[cfg["type"]]
-                    target = zero + amp * math.sin(omega * sim_t)  # 以 ZEROS 為中心
+                    target = zero + amp * math.sin(omega * sim_t)
                 else:
-                    target = zero                                   # 非 active → 保持站姿
+                    target = zero
                 if not args.dry_run and driver:
-                    send_cmd(driver, mid, target, cfg["kp"], cfg["kd"])
+                    # send_and_read：送指令後馬達立刻回應，比周期廣播幀優先到達
+                    send_and_read(driver, mid, target, cfg["kp"], cfg["kd"],
+                                  joint_pos, joint_vel, idx)
+                elif driver:
+                    # dry_run：只讀不送
+                    read_states(driver, [mid], joint_pos, joint_vel, id_to_idx)
 
             if step_cnt % 50 == 0:
                 print(f"[t={sim_t:6.1f}s]")
