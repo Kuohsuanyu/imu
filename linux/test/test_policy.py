@@ -435,9 +435,9 @@ def disable_all(driver_map, motor_ids: list):
             pass
 
 
-def _drain_until(driver, mid: int, timeout_s: float = 0.002):
+def _drain_until(driver, mid: int, timeout_s: float = 0.004):
     """持續消耗 CAN buffer 中其他馬達的幀，直到拿到 mid 的幀或超時。
-    不在 mismatch 之間 sleep，讓 CPU 盡快消耗掉錯誤幀。
+    每次嘗試之間加 0.2ms 間隔，避免洗爆 CAN socket buffer (ENOBUFS)。
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -447,8 +447,13 @@ def _drain_until(driver, mid: int, timeout_s: float = 0.002):
             msg = str(e)
             if "mismatch" in msg.lower():
                 _record_fail(mid, e)
-                continue   # 繼續消耗下一幀
-            raise          # 非 mismatch 錯誤才往上拋
+                time.sleep(0.0002)   # 200µs 讓 buffer 喘息
+                continue
+            if "buffer" in msg.lower() or "105" in msg:
+                # ENOBUFS：buffer 已滿，等久一點再試
+                time.sleep(0.001)
+                continue
+            raise   # 其他真實錯誤才往上拋
     return None   # 超時，用上次的值
 
 
