@@ -435,45 +435,51 @@ def disable_all(driver_map, motor_ids: list):
             pass
 
 
+def _drain_until(driver, mid: int, timeout_s: float = 0.002):
+    """持續消耗 CAN buffer 中其他馬達的幀，直到拿到 mid 的幀或超時。
+    不在 mismatch 之間 sleep，讓 CPU 盡快消耗掉錯誤幀。
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            return driver.get_actuator_state(actuator_id=mid)
+        except Exception as e:
+            msg = str(e)
+            if "mismatch" in msg.lower():
+                _record_fail(mid, e)
+                continue   # 繼續消耗下一幀
+            raise          # 非 mismatch 錯誤才往上拋
+    return None   # 超時，用上次的值
+
+
 def read_states(driver_map, motor_ids, joint_pos, joint_vel, id_to_idx, retries: int = 3):
     for mid in motor_ids:
         idx = id_to_idx[mid]
-        for attempt in range(retries):
-            try:
-                s = driver_map[mid].get_actuator_state(actuator_id=mid)
-                joint_pos[idx] = s.position
-                joint_vel[idx] = s.velocity
-                _record_ok(mid)
-                break
-            except Exception as e:
-                msg = _record_fail(mid, e)
-                if attempt == retries - 1:
-                    s_info = _stats(mid)
-                    print(f"[WARN] 馬達 {mid} 讀取失敗（{retries}次）連續={s_info['consec_fail']}: {msg!r}")
-                else:
-                    time.sleep(0.003)
+        s = _drain_until(driver_map[mid], mid)
+        if s is not None:
+            joint_pos[idx] = s.position
+            joint_vel[idx] = s.velocity
+            _record_ok(mid)
+        else:
+            s_info = _stats(mid)
+            if s_info["consec_fail"] % 10 == 0:   # 每 10 次才印一次，避免洗版
+                print(f"[WARN] 馬達 {mid} 讀取逾時（連續={s_info['consec_fail']}）")
 
 
 def send_and_read(driver_map, mid: int, step_pos: float, kp: float, kd: float,
                   joint_pos: np.ndarray, joint_vel: np.ndarray, idx: int,
                   retries: int = 3):
-    """送指令後立刻讀回同一顆馬達的狀態，避免多馬達 CAN 回應交錯。"""
+    """送指令後消耗 CAN buffer 直到拿到同一顆馬達的回應幀。"""
     send_cmd(driver_map, mid, step_pos, kp, kd)
-    time.sleep(0.003)   # 等馬達回應上 CAN bus
-    for attempt in range(retries):
-        try:
-            s = driver_map[mid].get_actuator_state(actuator_id=mid)
-            joint_pos[idx] = s.position
-            joint_vel[idx] = s.velocity
-            _record_ok(mid)
-            return
-        except Exception as e:
-            msg = _record_fail(mid, e)
-            if attempt == retries - 1:
-                s_info = _stats(mid)
-                print(f"[WARN] 馬達 {mid} 讀取失敗（{retries}次）連續={s_info['consec_fail']}: {msg!r}")
-            else:
-                time.sleep(0.003)
+    s = _drain_until(driver_map[mid], mid, timeout_s=0.003)
+    if s is not None:
+        joint_pos[idx] = s.position
+        joint_vel[idx] = s.velocity
+        _record_ok(mid)
+    else:
+        s_info = _stats(mid)
+        if s_info["consec_fail"] % 10 == 0:
+            print(f"[WARN] 馬達 {mid} 讀取逾時（連續={s_info['consec_fail']}）")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
