@@ -758,7 +758,7 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
     # Home ramp：先緩移到初始姿態，避免從零位暴衝
     if driver and not args.skip_home_ramp:
         init_joint_pos_from_reader(motor_ids, joint_pos, joint_vel, id_to_idx)
-        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, 0.2)
+        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, 0.05)
         input("\n  [確認] 已到達初始姿態，按 Enter 開始 Policy 推論...")
     elif args.skip_home_ramp:
         _warn("--skip-home-ramp：跳過 Home ramp，確認機器人已在初始姿態")
@@ -853,7 +853,7 @@ def run_zero(args, motor_ids: list, driver):
         _orig = dict(_ZEROS_DEG)
         for k in _ZEROS_DEG:
             _ZEROS_DEG[k] = 0.0
-        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, 0.2)
+        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, 0.05)
         _ZEROS_DEG.update(_orig)
 
     try:
@@ -914,7 +914,7 @@ def run_stand(args, motor_ids: list, driver):
 
     if driver and not args.skip_home_ramp:
         init_joint_pos_from_reader(motor_ids, joint_pos, joint_vel, id_to_idx)
-        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, 0.2)
+        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, 0.05)
 
     try:
         while True:
@@ -992,7 +992,7 @@ def run_sine(args, motor_ids: list, active_ids: list, driver):
     # 先移到站姿，再開始 sine
     if driver and not args.skip_home_ramp:
         init_joint_pos_from_reader(motor_ids, joint_pos, joint_vel, id_to_idx)
-        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, 0.2)
+        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, 0.05)
         input("\n  [確認] 已到站姿，按 Enter 開始 sine 測試...")
 
     try:
@@ -1103,7 +1103,7 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
     if driver and not args.skip_home_ramp:
         _ramp_pos = np.zeros(20, dtype=np.float32)
         _ramp_vel = np.zeros(20, dtype=np.float32)
-        home_ramp(motor_ids, driver, id_to_idx, _ramp_pos, _ramp_vel, 0.2)
+        home_ramp(motor_ids, driver, id_to_idx, _ramp_pos, _ramp_vel, 0.05)
         input("\n  [確認] 已到達站姿，按 Enter 開始 Replay...")
 
     errors        = []   # per-leg per-frame |policy_output - recorded_target|
