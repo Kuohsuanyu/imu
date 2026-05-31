@@ -657,34 +657,57 @@ def torque_ratio(target_rad: float, cur_rad: float, vel_rad: float, mid: int) ->
     return abs(tau) / max_t
 
 
-_RAMP_VEL_DEG_S = 8.0   # home_ramp 最大移動速度（°/s），調整此值控制快慢
+RAMP_DURATION_S = 3.0   # home_ramp 固定耗時（秒），調整此值控制快慢
 
 
 def home_ramp(motor_ids: list, driver, id_to_idx: dict,
               joint_pos: np.ndarray, joint_vel: np.ndarray,
               torque_limit_ratio: float = 0.05):
-    """從當前位置緩慢移動到 ZEROS 初始姿態。
-    使用速度限制（°/s）而非扭矩步長，每步都從 CanStateReader 讀實際位置，
-    確保不論初始位置是否已知都不會突然施大力。
+    """從當前位置以固定時間線性插值移動到 ZEROS 初始姿態。
+    固定跑完 RAMP_DURATION_S 秒，不以誤差判斷提前結束，確保平順。
     """
-    ctrl_dt  = 0.02
-    max_step = math.radians(_RAMP_VEL_DEG_S) * ctrl_dt   # rad per step
+    ctrl_dt = 0.02
 
     home_targets = {mid: math.radians(_ZEROS_DEG[MOTOR_CONFIG[mid]["name"]])
                     for mid in motor_ids if MOTOR_CONFIG[mid]["name"] in _ZEROS_DEG}
 
-    _section(f"Home Ramp — 緩移至初始姿態（{_RAMP_VEL_DEG_S}°/s）")
+    # 等到所有馬達都有實際位置資料（最多 3 秒）
+    print("  等待馬達位置資料...", end="", flush=True)
+    t_wait = time.time() + 3.0
+    while time.time() < t_wait:
+        if _can_reader is None:
+            break
+        if all(_can_reader.get(mid)[0] is not None for mid in motor_ids):
+            break
+        time.sleep(0.05)
+    print(" 完成")
+
+    # 讀取起始位置（插值的起點）
+    for mid in motor_ids:
+        if _can_reader is not None:
+            pos, vel = _can_reader.get(mid)
+            if pos is not None:
+                joint_pos[id_to_idx[mid]] = pos
+                joint_vel[id_to_idx[mid]] = vel
+
+    start_pos = {mid: joint_pos[id_to_idx[mid]] for mid in motor_ids}
+
+    _section(f"Home Ramp — {RAMP_DURATION_S:.0f}秒線性插值至初始姿態")
+    _info("起點: " + "  ".join(
+        f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:10]}={math.degrees(start_pos[m]):+.1f}°"
+        for m in motor_ids if m in home_targets))
     _info("目標: " + "  ".join(
         f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:10]}={math.degrees(home_targets[m]):+.0f}°"
         for m in motor_ids if m in home_targets))
-    _info(f"最大速度: {_RAMP_VEL_DEG_S}°/s  →  每步最大 {math.degrees(max_step):.2f}°  (dt={ctrl_dt*1000:.0f}ms)")
 
-    MAX_RAMP_STEPS = 3000   # 最多等 60 秒
+    t_start = time.time()
     step = 0
     while True:
-        t0 = time.time()
+        t0      = time.time()
+        elapsed = t0 - t_start
+        alpha   = min(elapsed / RAMP_DURATION_S, 1.0)   # 0.0 → 1.0
 
-        # 每步都先從 reader 讀取實際位置，不依賴上一步的命令位置
+        # 更新實際位置（用於顯示，不影響插值路徑）
         if _can_reader is not None:
             for mid in motor_ids:
                 pos, vel = _can_reader.get(mid)
@@ -692,30 +715,20 @@ def home_ramp(motor_ids: list, driver, id_to_idx: dict,
                     joint_pos[id_to_idx[mid]] = pos
                     joint_vel[id_to_idx[mid]] = vel
 
-        max_err = 0.0
         for mid in motor_ids:
             if mid not in home_targets:
                 continue
-            idx      = id_to_idx[mid]
-            cur      = joint_pos[idx]
-            err      = home_targets[mid] - cur
-            max_err  = max(max_err, abs(err))
-            # 速度限制：每步最多移動 max_step rad
-            step_pos = cur + math.copysign(min(abs(err), max_step), err)
-            send_cmd(driver, mid, step_pos, MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
+            interp = start_pos[mid] + alpha * (home_targets[mid] - start_pos[mid])
+            send_cmd(driver, mid, interp, MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
 
         if step % 25 == 0:
-            print(f"  [{step*ctrl_dt:5.1f}s] max_err={math.degrees(max_err):.1f}°  "
+            print(f"  [{elapsed:4.1f}/{RAMP_DURATION_S:.0f}s]  "
                   + "  ".join(f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:8]}"
                                f"={math.degrees(joint_pos[id_to_idx[m]]):+.1f}°"
                                for m in motor_ids if m in home_targets))
 
-        if max_err < math.radians(1.0):   # 1° 以內視為到達
-            _ok(f"Home Ramp 完成：誤差 {math.degrees(max_err):.2f}°，共 {step} 步 ({step*ctrl_dt:.1f}s)")
-            break
-
-        if step >= MAX_RAMP_STEPS:
-            _warn(f"Home Ramp 超時（{step} 步），最大殘差 {math.degrees(max_err):.1f}°，繼續執行")
+        if alpha >= 1.0:
+            _ok(f"Home Ramp 完成（{elapsed:.1f}s）")
             break
 
         step += 1
