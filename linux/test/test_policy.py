@@ -111,6 +111,111 @@ MOTOR_CONFIG = {
 ACTUATOR_TYPE_MAP = {"02": "Robstride02", "03": "Robstride03", "04": "Robstride04"}
 MAX_TORQUE = {"04": 84.0, "03": 42.0, "02": 11.9}
 
+# ── Raw CAN 狀態讀取器（仿 Rust firmware read_responses_update）─────────────────
+# 解決 PyRobstrideDriver.get_actuator_state() 的根本問題：
+#   - 多顆馬達同時廣播，讀到的幀可能來自其他馬達 → "CAN ID mismatch" exception
+#   - mux=0x15 (unsolicited fault) → Python driver 直接 panic，Rust 版本有處理
+# 解法：直接開 raw socketcan socket 讀所有幀，按 motor_id 分類存入字典
+import socket as _socket
+import struct as _struct
+import threading as _threading
+
+# 各型號物理量程（來自 deploye_robot/firmware/src/robstride_utils.rs）
+_MOTOR_PHYS_RANGES = {
+    "04": {"angle": (-4 * math.pi, 4 * math.pi), "vel": (-15.0, 15.0)},
+    "03": {"angle": (-4 * math.pi, 4 * math.pi), "vel": (-20.0, 20.0)},
+    "02": {"angle": (-4 * math.pi, 4 * math.pi), "vel": (-44.0, 44.0)},
+}
+_CAN_FRAME_SIZE = 16  # socketcan struct can_frame 大小（bytes）
+
+
+def _can_scale(raw_u16: int, phys_min: float, phys_max: float) -> float:
+    """CAN u16 [0, 65535] → 物理量（同 Rust RangeSet::scale_value）。"""
+    return phys_min + (raw_u16 / 65535.0) * (phys_max - phys_min)
+
+
+class CanStateReader:
+    """背景執行緒持續讀取所有 CAN 幀並按 motor_id 分類。
+
+    幀格式（socketcan struct can_frame = 16 bytes）：
+      byte[0]   host_id
+      byte[1]   actuator_can_id  ← motor ID
+      byte[2]   fault_flags / mode
+      byte[3]   mux（低 5 bits）  0x02=feedback  0x15=fault
+      byte[4-7] len/pad
+      byte[8-9]   angle_be    (big-endian u16)
+      byte[10-11] vel_be      (big-endian u16)
+      byte[12-13] torque_be   (big-endian u16)
+      byte[14-15] temp_be     (big-endian u16)
+    """
+
+    def __init__(self, interfaces: list, motor_config: dict):
+        self._lock   = _threading.Lock()
+        self._state: dict = {}  # motor_id → {"pos": float, "vel": float}
+        self._mconfig = motor_config
+        self._stop   = _threading.Event()
+
+        for iface in interfaces:
+            t = _threading.Thread(target=self._read_loop, args=(iface,),
+                                  daemon=True, name=f"can-reader-{iface}")
+            t.start()
+
+    def _read_loop(self, iface: str):
+        try:
+            sock = _socket.socket(_socket.AF_CAN, _socket.SOCK_RAW, _socket.CAN_RAW)
+            sock.bind((iface,))
+            sock.settimeout(0.1)
+        except OSError as e:
+            print(f"  [CanReader] {iface} 開啟失敗: {e}")
+            return
+
+        try:
+            while not self._stop.is_set():
+                try:
+                    frame = sock.recv(_CAN_FRAME_SIZE)
+                except _socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+                if len(frame) < _CAN_FRAME_SIZE:
+                    continue
+
+                mux = frame[3] & 0x1F   # byte[3] 低 5 bits = mux
+                if mux != 0x02:         # 只處理 feedback（0x15 fault 靜默忽略）
+                    continue
+
+                motor_id = frame[1]     # actuator_can_id 在 byte[1]
+                if motor_id not in self._mconfig:
+                    continue
+
+                mtype  = self._mconfig[motor_id]["type"]
+                ranges = _MOTOR_PHYS_RANGES.get(mtype, _MOTOR_PHYS_RANGES["03"])
+
+                raw_angle = _struct.unpack_from(">H", frame, 8)[0]
+                raw_vel   = _struct.unpack_from(">H", frame, 10)[0]
+                pos = _can_scale(raw_angle, *ranges["angle"])
+                vel = _can_scale(raw_vel,   *ranges["vel"])
+
+                with self._lock:
+                    self._state[motor_id] = {"pos": pos, "vel": vel}
+        finally:
+            sock.close()
+
+    def get(self, motor_id: int):
+        """回傳最新 (pos_rad, vel_rad_s)。若尚無資料回傳 (None, None)。"""
+        with self._lock:
+            s = self._state.get(motor_id)
+        if s is None:
+            return None, None
+        return s["pos"], s["vel"]
+
+    def stop(self):
+        self._stop.set()
+
+
+_can_reader: "CanStateReader | None" = None
+
 # 正弦波參數（與舊版 test_motor_policy.py 一致，已實測通過）
 SINE_AMP_RAD = {
     "04": math.radians(15),   # hip pitch / knee ±15°
@@ -312,6 +417,12 @@ def setup_driver(can_assignment: dict) -> dict:
         print(f"    enable 馬達 {mid:2d} ({cfg['name']:<28})")
     time.sleep(0.3)
 
+    # 啟動 raw CAN reader（Phase 3 之前，讓馬達廣播資料先被收集）
+    global _can_reader
+    ifaces = sorted(set(can_assignment.values()))
+    _can_reader = CanStateReader(ifaces, MOTOR_CONFIG)
+    print(f"\n  [CAN Reader] 已啟動 raw 幀讀取: {ifaces}（無 mismatch 問題）")
+
     # Phase 3: 背景發送 + 互動確認
     print(f"\n  [Phase 3] 持續送指令 — 摸馬達確認鎖住後輸入 ID")
     print(f"  格式：")
@@ -424,6 +535,16 @@ def _is_mismatch(e: Exception) -> bool:
 
 
 def read_states(driver_map, motor_ids, joint_pos, joint_vel, id_to_idx, retries: int = 3):
+    """讀取馬達位置與速度。優先使用 raw CAN reader（完全無 mismatch 問題）。"""
+    if _can_reader is not None:
+        for mid in motor_ids:
+            pos, vel = _can_reader.get(mid)
+            if pos is not None:
+                joint_pos[id_to_idx[mid]] = pos
+                joint_vel[id_to_idx[mid]] = vel
+        return
+
+    # fallback: PyRobstrideDriver（會有 mismatch 警告但不影響控制）
     for mid in motor_ids:
         idx = id_to_idx[mid]
         for attempt in range(retries):
@@ -442,9 +563,19 @@ def read_states(driver_map, motor_ids, joint_pos, joint_vel, id_to_idx, retries:
 def send_and_read(driver_map, mid: int, step_pos: float, kp: float, kd: float,
                   joint_pos: np.ndarray, joint_vel: np.ndarray, idx: int,
                   retries: int = 3):
-    """送指令後立刻讀回同一顆馬達的狀態，避免多馬達 CAN 回應交錯。"""
+    """送指令後讀回狀態。優先使用 raw CAN reader（無 mismatch）。"""
     send_cmd(driver_map, mid, step_pos, kp, kd)
-    time.sleep(0.003)   # 等馬達回應上 CAN bus
+
+    if _can_reader is not None:
+        time.sleep(0.003)
+        pos, vel = _can_reader.get(mid)
+        if pos is not None:
+            joint_pos[idx] = pos
+            joint_vel[idx] = vel
+        return
+
+    # fallback
+    time.sleep(0.003)
     for attempt in range(retries):
         try:
             s = driver_map[mid].get_actuator_state(actuator_id=mid)
