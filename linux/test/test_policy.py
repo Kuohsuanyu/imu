@@ -439,11 +439,17 @@ def setup_driver(can_assignment: dict) -> dict:
         while not stop_event.is_set():
             for mid in sorted(can_assignment.keys()):
                 cfg = MOTOR_CONFIG[mid]
+                # 保持當前位置，不強制移到 0° 避免觸發過載保護
+                if _can_reader is not None:
+                    cur, _ = _can_reader.get(mid)
+                    hold_pos = cur if cur is not None else 0.0
+                else:
+                    hold_pos = 0.0
                 try:
                     driver_map[mid].send_command(
                         actuator_id=mid,
                         command=PyActuatorCommand(
-                            position=0.0, velocity=0.0, torque=0.0,
+                            position=hold_pos, velocity=0.0, torque=0.0,
                             kp=cfg["kp"], kd=cfg["kd"]),
                     )
                 except Exception:
@@ -532,6 +538,39 @@ def disable_all(driver_map, motor_ids: list):
 
 def _is_mismatch(e: Exception) -> bool:
     return "mismatch" in str(e).lower()
+
+
+def init_joint_pos_from_reader(motor_ids: list, joint_pos: np.ndarray,
+                               joint_vel: np.ndarray, id_to_idx: dict,
+                               timeout: float = 3.0):
+    """從 CanStateReader 讀取所有馬達的實際當前位置，填入 joint_pos。
+    在 home_ramp 開始前呼叫，確保從真實位置出發，避免突然施力。
+    """
+    if _can_reader is None:
+        return
+    print("  [Init] 讀取馬達實際位置...")
+    t_end = time.time() + timeout
+    ready = set()
+    while time.time() < t_end and len(ready) < len(motor_ids):
+        for mid in motor_ids:
+            if mid in ready:
+                continue
+            pos, vel = _can_reader.get(mid)
+            if pos is not None:
+                joint_pos[id_to_idx[mid]] = pos
+                joint_vel[id_to_idx[mid]] = vel
+                ready.add(mid)
+        if len(ready) < len(motor_ids):
+            time.sleep(0.05)
+
+    if ready:
+        print("  [Init] 已讀到位置: " + "  ".join(
+            f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:8]}="
+            f"{math.degrees(joint_pos[id_to_idx[m]]):+.1f}°"
+            for m in motor_ids if m in ready))
+    missing = [m for m in motor_ids if m not in ready]
+    if missing:
+        _warn(f"以下馬達未收到位置資料，從 0° 出發: {missing}")
 
 
 def read_states(driver_map, motor_ids, joint_pos, joint_vel, id_to_idx, retries: int = 3):
@@ -710,6 +749,7 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
 
     # Home ramp：先緩移到初始姿態，避免從零位暴衝
     if driver and not args.skip_home_ramp:
+        init_joint_pos_from_reader(motor_ids, joint_pos, joint_vel, id_to_idx)
         home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, args.torque_limit)
         input("\n  [確認] 已到達初始姿態，按 Enter 開始 Policy 推論...")
     elif args.skip_home_ramp:
@@ -800,6 +840,7 @@ def run_zero(args, motor_ids: list, driver):
     # 先緩移到零位，避免從非零位突然跳到 0°
     if driver and not args.skip_home_ramp:
         _warn("zero 模式：先緩移到 0°，確認機器人不會撞到東西")
+        init_joint_pos_from_reader(motor_ids, joint_pos, joint_vel, id_to_idx)
         # 臨時用 _ZEROS_DEG 全設 0 的版本做 ramp
         _orig = dict(_ZEROS_DEG)
         for k in _ZEROS_DEG:
@@ -864,6 +905,7 @@ def run_stand(args, motor_ids: list, driver):
     print()
 
     if driver and not args.skip_home_ramp:
+        init_joint_pos_from_reader(motor_ids, joint_pos, joint_vel, id_to_idx)
         home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, args.torque_limit)
 
     try:
@@ -941,6 +983,7 @@ def run_sine(args, motor_ids: list, active_ids: list, driver):
 
     # 先移到站姿，再開始 sine
     if driver and not args.skip_home_ramp:
+        init_joint_pos_from_reader(motor_ids, joint_pos, joint_vel, id_to_idx)
         home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel, args.torque_limit)
         input("\n  [確認] 已到站姿，按 Enter 開始 sine 測試...")
 
