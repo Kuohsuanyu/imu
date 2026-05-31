@@ -417,13 +417,25 @@ def setup_driver(can_assignment: dict) -> dict:
         print(f"    enable 馬達 {mid:2d} ({cfg['name']:<28})")
     time.sleep(0.3)
 
-    # 啟動 raw CAN reader，等到所有馬達都有第一筆資料才繼續
+    # 啟動 raw CAN reader
+    # Robstride 馬達不主動廣播，只有收到指令後才回傳 feedback（mux=0x02）
+    # → 先送一次 kp=0 kd=0 無力指令讓每顆馬達回傳第一幀，reader 才能捕捉到位置
     global _can_reader
     ifaces = sorted(set(can_assignment.values()))
     _can_reader = CanStateReader(ifaces, MOTOR_CONFIG)
     print(f"\n  [CAN Reader] 已啟動 raw 幀讀取: {ifaces}")
-    print(f"  等待所有馬達回傳位置資料...", end="", flush=True)
-    t_end = time.time() + 3.0
+    print(f"  送初始化指令讓馬達回傳位置...", end="", flush=True)
+    for mid in sorted(can_assignment.keys()):
+        try:
+            driver_map[mid].send_command(
+                actuator_id=mid,
+                command=PyActuatorCommand(position=0.0, velocity=0.0, torque=0.0,
+                                          kp=0.0, kd=0.0),
+            )
+        except Exception:
+            pass
+    time.sleep(0.15)   # 等馬達回傳
+    t_end = time.time() + 2.0
     while time.time() < t_end:
         if all(_can_reader.get(mid)[0] is not None for mid in can_assignment):
             break
@@ -432,7 +444,7 @@ def setup_driver(can_assignment: dict) -> dict:
     missing = [mid for mid in can_assignment if _can_reader.get(mid)[0] is None]
     print(f" 完成（{len(ready)}/{len(can_assignment)} 顆）")
     if missing:
-        _warn(f"未收到資料的馬達: {missing}（send_loop 將跳過這些馬達直到有資料）")
+        _warn(f"以下馬達未回傳資料（可能離線）: {missing}")
 
     # Phase 3: 背景發送 + 互動確認
     print(f"\n  [Phase 3] 持續送指令 — 摸馬達確認鎖住後輸入 ID")
