@@ -657,57 +657,61 @@ def torque_ratio(target_rad: float, cur_rad: float, vel_rad: float, mid: int) ->
     return abs(tau) / max_t
 
 
+_RAMP_VEL_DEG_S = 8.0   # home_ramp 最大移動速度（°/s），調整此值控制快慢
+
+
 def home_ramp(motor_ids: list, driver, id_to_idx: dict,
               joint_pos: np.ndarray, joint_vel: np.ndarray,
-              torque_limit_ratio: float = 0.5):
+              torque_limit_ratio: float = 0.05):
     """從當前位置緩慢移動到 ZEROS 初始姿態。
-    每顆馬達依自身 kp / max_torque 自動計算安全步長，確保任何時刻扭矩 ≤ torque_limit_ratio。
-    避免從任意位置開機後暴衝到初始姿態造成過載。
+    使用速度限制（°/s）而非扭矩步長，每步都從 CanStateReader 讀實際位置，
+    確保不論初始位置是否已知都不會突然施大力。
     """
-    ctrl_dt = 0.02
+    ctrl_dt  = 0.02
+    max_step = math.radians(_RAMP_VEL_DEG_S) * ctrl_dt   # rad per step
+
     home_targets = {mid: math.radians(_ZEROS_DEG[MOTOR_CONFIG[mid]["name"]])
                     for mid in motor_ids if MOTOR_CONFIG[mid]["name"] in _ZEROS_DEG}
-    safe_steps   = {mid: _safe_step_rad(mid, torque_limit_ratio) for mid in motor_ids}
 
-    _section(f"Home Ramp — 緩移至初始姿態（扭矩限制 ≤{torque_limit_ratio*100:.0f}%）")
+    _section(f"Home Ramp — 緩移至初始姿態（{_RAMP_VEL_DEG_S}°/s）")
     _info("目標: " + "  ".join(
         f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:10]}={math.degrees(home_targets[m]):+.0f}°"
         for m in motor_ids if m in home_targets))
-    _info("安全步長: " + "  ".join(
-        f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:10]}≤{math.degrees(safe_steps[m]):.1f}°"
-        for m in motor_ids))
+    _info(f"最大速度: {_RAMP_VEL_DEG_S}°/s  →  每步最大 {math.degrees(max_step):.2f}°  (dt={ctrl_dt*1000:.0f}ms)")
 
-    MAX_RAMP_STEPS = 400
+    MAX_RAMP_STEPS = 3000   # 最多等 60 秒
     step = 0
     while True:
         t0 = time.time()
 
+        # 每步都先從 reader 讀取實際位置，不依賴上一步的命令位置
+        if _can_reader is not None:
+            for mid in motor_ids:
+                pos, vel = _can_reader.get(mid)
+                if pos is not None:
+                    joint_pos[id_to_idx[mid]] = pos
+                    joint_vel[id_to_idx[mid]] = vel
+
         max_err = 0.0
-        max_torque_ratio = 0.0
         for mid in motor_ids:
             if mid not in home_targets:
                 continue
             idx      = id_to_idx[mid]
-            cfg      = MOTOR_CONFIG[mid]
-            err      = home_targets[mid] - joint_pos[idx]
+            cur      = joint_pos[idx]
+            err      = home_targets[mid] - cur
             max_err  = max(max_err, abs(err))
-            clamp    = safe_steps[mid]
-            step_pos = joint_pos[idx] + math.copysign(min(abs(err), clamp), err)
-            est_torque = cfg["kp"] * abs(step_pos - joint_pos[idx])
-            max_torque_ratio = max(max_torque_ratio,
-                                   est_torque / MAX_TORQUE[cfg["type"]])
-            send_and_read(driver, mid, step_pos, cfg["kp"], cfg["kd"],
-                          joint_pos, joint_vel, idx)
+            # 速度限制：每步最多移動 max_step rad
+            step_pos = cur + math.copysign(min(abs(err), max_step), err)
+            send_cmd(driver, mid, step_pos, MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
 
         if step % 25 == 0:
             print(f"  [{step*ctrl_dt:5.1f}s] max_err={math.degrees(max_err):.1f}°  "
-                  f"max_τ={max_torque_ratio*100:.0f}%  "
                   + "  ".join(f"{MOTOR_CONFIG[m]['name'].replace('dof_','')[:8]}"
                                f"={math.degrees(joint_pos[id_to_idx[m]]):+.1f}°"
                                for m in motor_ids if m in home_targets))
 
-        if max_err < 0.1:
-            _ok(f"Home Ramp 完成：誤差 {math.degrees(max_err):.2f}°，共 {step} 步 ({step*ctrl_dt:.1f}s)，最大扭矩比 {max_torque_ratio*100:.0f}%")
+        if max_err < math.radians(1.0):   # 1° 以內視為到達
+            _ok(f"Home Ramp 完成：誤差 {math.degrees(max_err):.2f}°，共 {step} 步 ({step*ctrl_dt:.1f}s)")
             break
 
         if step >= MAX_RAMP_STEPS:
