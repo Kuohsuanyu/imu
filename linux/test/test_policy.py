@@ -419,6 +419,10 @@ def disable_all(driver_map, motor_ids: list):
             pass
 
 
+def _is_mismatch(e: Exception) -> bool:
+    return "mismatch" in str(e).lower()
+
+
 def read_states(driver_map, motor_ids, joint_pos, joint_vel, id_to_idx, retries: int = 3):
     for mid in motor_ids:
         idx = id_to_idx[mid]
@@ -429,9 +433,9 @@ def read_states(driver_map, motor_ids, joint_pos, joint_vel, id_to_idx, retries:
                 joint_vel[idx] = s.velocity
                 break
             except Exception as e:
-                if attempt == retries - 1:
+                if attempt == retries - 1 and not _is_mismatch(e):
                     print(f"[WARN] 馬達 {mid} 讀取失敗（{retries}次）: {e}")
-                else:
+                elif not _is_mismatch(e):
                     time.sleep(0.003)
 
 
@@ -448,9 +452,9 @@ def send_and_read(driver_map, mid: int, step_pos: float, kp: float, kd: float,
             joint_vel[idx] = s.velocity
             return
         except Exception as e:
-            if attempt == retries - 1:
+            if attempt == retries - 1 and not _is_mismatch(e):
                 print(f"[WARN] 馬達 {mid} 讀取失敗（{retries}次）: {e}")
-            else:
+            elif not _is_mismatch(e):
                 time.sleep(0.003)
 
 
