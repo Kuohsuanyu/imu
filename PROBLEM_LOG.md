@@ -75,6 +75,43 @@ RuntimeError: IO error: No buffer space available (os error 105)
 
 ---
 
+## P6 — CanStateReader 無法取得初始位置（0/N 顆）
+
+**現象**
+```
+等待所有馬達回傳位置資料... 完成（0/1 顆）
+[WARN] 未收到資料的馬達: [44]
+```
+等待 3 秒後仍然讀不到任何馬達位置。
+
+**根本原因**
+Robstride 馬達**不主動廣播**狀態幀。只有收到控制指令後，才會回傳 mux=0x02 的 feedback 幀。
+啟動 CanStateReader 後若沒有任何指令送出，reader 永遠不會收到資料。
+
+**解法**
+啟動 reader 後，立刻對每顆馬達送一次 `kp=0 kd=0` 的無力指令（不會移動），觸發馬達回傳第一幀位置資料，reader 捕捉後即可正常運作。
+
+---
+
+## P7 — 啟動時馬達瞬間扯動（進保護）
+
+**現象**
+程式啟動後馬達會突然抖動一下，有時直接觸發過載保護進入 fault state。
+
+**根本原因（三層）**
+
+1. **Phase 3 send_loop 送 position=0°**：CanStateReader 剛啟動時還沒有資料，fallback 到 `hold_pos=0.0`，帶全力 kp 強制移到 0° → 瞬間大力。
+
+2. **home_ramp 從 joint_pos=0 出發**：`joint_pos` 初始化為全零，不是馬達實際位置。第一步計算的 step_pos 是以 0° 為基準，但馬達可能在 -50°，PD 誤差 50° → 大力。
+
+3. **home_ramp 用誤差判斷提前結束**：初始位置錯誤（0°）→ 第一步送出 → reader 讀到實際位置（-49.8°）→ 誤差 < 1° → 立刻結束，整個 ramp 只花 0.0s。
+
+**解法**
+- Phase 3 send_loop：等所有馬達都有資料（來自 P6 的 prime 指令）再開始，沒有資料就 `continue`（完全不送指令），不送 0°。
+- home_ramp：等所有馬達有資料 → 讀實際起點位置 → 固定 3 秒線性插值到目標，不以誤差判斷提前結束。
+
+---
+
 ## P5 — SSH 斷線（切換網路時）
 
 **現象**
