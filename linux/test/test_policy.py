@@ -417,11 +417,22 @@ def setup_driver(can_assignment: dict) -> dict:
         print(f"    enable 馬達 {mid:2d} ({cfg['name']:<28})")
     time.sleep(0.3)
 
-    # 啟動 raw CAN reader（Phase 3 之前，讓馬達廣播資料先被收集）
+    # 啟動 raw CAN reader，等到所有馬達都有第一筆資料才繼續
     global _can_reader
     ifaces = sorted(set(can_assignment.values()))
     _can_reader = CanStateReader(ifaces, MOTOR_CONFIG)
-    print(f"\n  [CAN Reader] 已啟動 raw 幀讀取: {ifaces}（無 mismatch 問題）")
+    print(f"\n  [CAN Reader] 已啟動 raw 幀讀取: {ifaces}")
+    print(f"  等待所有馬達回傳位置資料...", end="", flush=True)
+    t_end = time.time() + 3.0
+    while time.time() < t_end:
+        if all(_can_reader.get(mid)[0] is not None for mid in can_assignment):
+            break
+        time.sleep(0.05)
+    ready = [mid for mid in can_assignment if _can_reader.get(mid)[0] is not None]
+    missing = [mid for mid in can_assignment if _can_reader.get(mid)[0] is None]
+    print(f" 完成（{len(ready)}/{len(can_assignment)} 顆）")
+    if missing:
+        _warn(f"未收到資料的馬達: {missing}（send_loop 將跳過這些馬達直到有資料）")
 
     # Phase 3: 背景發送 + 互動確認
     print(f"\n  [Phase 3] 持續送指令 — 摸馬達確認鎖住後輸入 ID")
@@ -439,17 +450,14 @@ def setup_driver(can_assignment: dict) -> dict:
         while not stop_event.is_set():
             for mid in sorted(can_assignment.keys()):
                 cfg = MOTOR_CONFIG[mid]
-                # 保持當前位置，不強制移到 0° 避免觸發過載保護
-                if _can_reader is not None:
-                    cur, _ = _can_reader.get(mid)
-                    hold_pos = cur if cur is not None else 0.0
-                else:
-                    hold_pos = 0.0
+                cur, _ = _can_reader.get(mid)
+                if cur is None:
+                    continue  # 尚無資料，跳過，不送 0° 避免瞬間施力
                 try:
                     driver_map[mid].send_command(
                         actuator_id=mid,
                         command=PyActuatorCommand(
-                            position=hold_pos, velocity=0.0, torque=0.0,
+                            position=cur, velocity=0.0, torque=0.0,
                             kp=cfg["kp"], kd=cfg["kd"]),
                     )
                 except Exception:
