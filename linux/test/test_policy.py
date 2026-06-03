@@ -855,6 +855,9 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
                     idx = motor_id_to_policy_idx(mid)
                     pos = float(actions[idx]) if mid in active_ids else 0.0
                     send_cmd(driver, mid, pos, MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
+            elif args.dry_run:
+                # 模擬完美追蹤：讓 policy 下一步看到位置已到達目標
+                joint_pos[:] = actions
 
             if step_cnt % 50 == 0:
                 overload_flags = []
