@@ -437,27 +437,52 @@ def setup_driver(can_assignment: dict) -> dict:
     ifaces = sorted(set(can_assignment.values()))
     _can_reader = CanStateReader(ifaces, MOTOR_CONFIG)
     print(f"\n  [CAN Reader] 已啟動 raw 幀讀取: {ifaces}")
-    print(f"  送初始化指令讓馬達回傳位置...", end="", flush=True)
-    for mid in sorted(can_assignment.keys()):
-        try:
-            driver_map[mid].send_command(
-                actuator_id=mid,
-                command=PyActuatorCommand(position=0.0, velocity=0.0, torque=0.0,
-                                          kp=0.0, kd=0.0),
-            )
-        except Exception:
-            pass
-    time.sleep(0.15)   # 等馬達回傳
-    t_end = time.time() + 2.0
-    while time.time() < t_end:
-        if all(_can_reader.get(mid)[0] is not None for mid in can_assignment):
+    def _prime_once():
+        """對所有馬達送一次 kp=0 kd=0，觸發 feedback 回傳。"""
+        for mid in sorted(can_assignment.keys()):
+            try:
+                driver_map[mid].send_command(
+                    actuator_id=mid,
+                    command=PyActuatorCommand(position=0.0, velocity=0.0, torque=0.0,
+                                              kp=0.0, kd=0.0),
+                )
+            except Exception:
+                pass
+
+    print(f"  送初始化指令讓馬達回傳位置...")
+    _prime_once()
+    time.sleep(0.15)
+
+    # 等最多 2 秒收齊；沒回應的馬達重新 enable 再 prime（最多 3 輪）
+    for attempt in range(3):
+        t_end = time.time() + 2.0
+        while time.time() < t_end:
+            if all(_can_reader.get(mid)[0] is not None for mid in can_assignment):
+                break
+            time.sleep(0.05)
+
+        missing = [mid for mid in can_assignment if _can_reader.get(mid)[0] is None]
+        if not missing:
             break
-        time.sleep(0.05)
-    ready = [mid for mid in can_assignment if _can_reader.get(mid)[0] is not None]
+
+        print(f"  [嘗試 {attempt+1}/3] 以下馬達未回應，重新 enable: {missing}")
+        for mid in missing:
+            cfg = MOTOR_CONFIG[mid]
+            repeat = 3 if cfg["type"] == "04" else 1
+            for _ in range(repeat):
+                try:
+                    driver_map[mid].enable_actuator(actuator_id=mid)
+                except Exception:
+                    pass
+                time.sleep(0.1)
+        _prime_once()
+        time.sleep(0.15)
+
+    ready   = [mid for mid in can_assignment if _can_reader.get(mid)[0] is not None]
     missing = [mid for mid in can_assignment if _can_reader.get(mid)[0] is None]
-    print(f" 完成（{len(ready)}/{len(can_assignment)} 顆）")
+    print(f"  完成（{len(ready)}/{len(can_assignment)} 顆）")
     if missing:
-        _warn(f"以下馬達未回傳資料（可能離線）: {missing}")
+        _warn(f"以下馬達仍未回傳資料（可能在保護模式）: {missing}")
 
     # Phase 3: 背景發送 + 互動確認
     print(f"\n  [Phase 3] 持續送指令 — 摸馬達確認鎖住後輸入 ID")
