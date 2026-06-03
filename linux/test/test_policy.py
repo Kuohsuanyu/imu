@@ -222,7 +222,20 @@ SINE_AMP_RAD = {
     "03": math.radians(10),   # hip roll / yaw   ±10°
     "02": math.radians(8),    # ankle             ±8°
 }
-SINE_FREQ_HZ = 0.3   # 0.3 Hz 慢速確認響應
+SINE_FREQ_HZ = 0.3   # 預設頻率，可由 --sine-freq 覆蓋
+
+
+def _sine_peak_torque(mid: int, freq_hz: float) -> tuple[float, float]:
+    """估算指定頻率下的峰值扭矩與佔最大值比例。
+    主要來源：kd × 振幅 × ω（速度項，頻率越高越大）。
+    """
+    cfg   = MOTOR_CONFIG[mid]
+    amp   = SINE_AMP_RAD[cfg["type"]]
+    omega = 2 * math.pi * freq_hz
+    peak  = cfg["kd"] * amp * omega          # kd 速度項（主導）
+    peak += cfg["kp"] * amp * 0.05           # kp 位置誤差估算（5% 相位差）
+    max_t = MAX_TORQUE[cfg["type"]]
+    return peak, peak / max_t
 
 # 安全關節限制（policy 輸出的 hard clip）
 _ZEROS_DEG = {
@@ -982,41 +995,60 @@ def run_stand(args, motor_ids: list, driver):
 
 def run_sine(args, motor_ids: list, active_ids: list, driver):
     """正弦波運動（以 ZEROS 站姿為中心，非馬達機械零點）。
-    用於確認每顆馬達在站姿附近的響應與扭矩輸出：
-      type04 ±15° @ 0.3 Hz（hip pitch / knee）
-      type03 ±10° @ 0.3 Hz（hip roll / yaw）
-      type02  ±8° @ 0.3 Hz（ankle）
+    --sine-freq 控制頻率（Hz），自動計算預估峰值扭矩並警告是否超限。
     非 active_ids 的馬達保持 ZEROS 站姿位置。
     """
+    freq_hz   = getattr(args, "sine_freq", SINE_FREQ_HZ)
     ctrl_dt   = 0.02
     step_cnt  = 0
-    omega     = 2 * math.pi * SINE_FREQ_HZ
+    omega     = 2 * math.pi * freq_hz
     id_to_idx = {mid: motor_id_to_policy_idx(mid) for mid in motor_ids}
     joint_pos = np.zeros(20, dtype=np.float32)
     joint_vel = np.zeros(20, dtype=np.float32)
 
-    # ZEROS 在 rad（sine 的中心點）
     _zeros_rad = {mid: math.radians(_ZEROS_DEG.get(MOTOR_CONFIG[mid]["name"], 0.0))
                   for mid in motor_ids}
 
     active_set = set(active_ids)
-    _banner(f"正弦波模式 — {SINE_FREQ_HZ} Hz，中心=ZEROS 站姿")
+    _banner(f"正弦波模式 — {freq_hz:.2f} Hz，中心=ZEROS 站姿")
     _info(f"{'DRY RUN（不送指令）' if args.dry_run else 'LIVE CAN — 馬達上電中'}")
-    _info("振幅：type04=±15°  type03=±10°  type02=±8°")
+    _info(f"頻率: {freq_hz:.2f} Hz   振幅: type04=±15°  type03=±10°  type02=±8°")
     _info("中心：ZEROS 站姿（不是馬達機械 0°）")
     _info("Ctrl+C 停止")
     if active_set != set(motor_ids):
         active_names = [MOTOR_CONFIG[m]["name"].replace("dof_","") for m in active_ids]
         print(f"  [限制] 只有 {active_ids} ({active_names}) 做正弦波，其餘保持 ZEROS 站姿")
-    print("\n  ── 各關節 sine 實際範圍 ──")
-    print(f"  {'關節':<26} {'ZEROS':>6} {'振幅':>6} {'最小':>8} {'最大':>8}")
+
+    # 預估峰值扭矩表
+    print(f"\n  ── 各關節 sine 實際範圍 & 預估峰值扭矩（{freq_hz:.2f} Hz）──")
+    print(f"  {'關節':<26} {'ZEROS':>6} {'最小':>8} {'最大':>8}  {'峰值扭矩':>10}  {'佔比':>6}")
+    over_torque = []
     for mid in motor_ids:
-        cfg  = MOTOR_CONFIG[mid]
-        name = cfg["name"].replace("dof_","")
-        z    = _ZEROS_DEG.get(cfg["name"], 0.0)
-        amp  = math.degrees(SINE_AMP_RAD[cfg["type"]])
-        tag  = "" if mid in active_set else " [hold]"
-        print(f"  {name:<26} {z:>+6.0f}° {amp:>+6.0f}°  {z-amp:>+7.1f}°  {z+amp:>+7.1f}°{tag}")
+        cfg   = MOTOR_CONFIG[mid]
+        name  = cfg["name"].replace("dof_", "")
+        z     = _ZEROS_DEG.get(cfg["name"], 0.0)
+        amp   = math.degrees(SINE_AMP_RAD[cfg["type"]])
+        tag   = "" if mid in active_set else " [hold]"
+        if mid in active_set:
+            peak, ratio = _sine_peak_torque(mid, freq_hz)
+            warn = " !!OVER" if ratio >= args.torque_limit else ""
+            if ratio >= args.torque_limit:
+                over_torque.append((mid, name, ratio))
+            torque_str = f"{peak:5.1f}/{MAX_TORQUE[cfg['type']]:.0f}Nm  {ratio*100:4.0f}%{warn}"
+        else:
+            torque_str = f"{'[hold]':>17}"
+        print(f"  {name:<26} {z:>+6.0f}°  {z-amp:>+7.1f}°  {z+amp:>+7.1f}°  {torque_str}{tag}")
+    if over_torque:
+        _warn(f"以下關節預估扭矩超過 {args.torque_limit*100:.0f}% 上限，建議降低頻率：")
+        for mid, name, ratio in over_torque:
+            _warn(f"  {name}  {ratio*100:.0f}%")
+        # 計算不超限的最大頻率
+        max_safe_freq = min(
+            (args.torque_limit * MAX_TORQUE[MOTOR_CONFIG[m]["type"]] /
+             (MOTOR_CONFIG[m]["kd"] * SINE_AMP_RAD[MOTOR_CONFIG[m]["type"]] * 2 * math.pi))
+            for m, _, _ in over_torque
+        )
+        _warn(f"建議最大頻率: {max_safe_freq:.2f} Hz")
 
     # 先移到站姿，再開始 sine
     if driver and not args.skip_home_ramp:
@@ -1530,6 +1562,11 @@ def main():
                         help="H30 串口（預設: /dev/ttyACM0）")
     parser.add_argument("--imu-baud", type=int, default=460800,
                         help="H30 波特率（預設: 460800）")
+
+    # sine 模式
+    parser.add_argument("--sine-freq", type=float, default=SINE_FREQ_HZ,
+                        help=f"sine 模式頻率（Hz，預設: {SINE_FREQ_HZ}）；"
+                             "頻率越高扭矩越大，自動警告超限")
 
     # check 模式
     parser.add_argument("--steps", type=int, default=100,
