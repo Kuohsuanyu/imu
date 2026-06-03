@@ -812,6 +812,13 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
     joint_pos = np.zeros(20, dtype=np.float32)
     joint_vel = np.zeros(20, dtype=np.float32)
 
+    # Dry-run：以 ZEROS 站姿初始化 joint_pos，避免策略看到離初始姿態 50° 的假輸入
+    if args.dry_run:
+        for mid in motor_ids:
+            name = MOTOR_CONFIG[mid]["name"]
+            if name in _ZEROS_DEG:
+                joint_pos[id_to_idx[mid]] = math.radians(_ZEROS_DEG[name])
+
     imu_info = "真實 H30 IMU" if bridge is not None else "假 IMU（直立靜止）"
     _section(f"運行配置")
     _info(f"IMU   : {imu_info}")
