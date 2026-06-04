@@ -853,8 +853,14 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
             if not args.dry_run and driver:
                 for mid in motor_ids:
                     idx = motor_id_to_policy_idx(mid)
-                    pos = float(actions[idx]) if mid in active_ids else 0.0
-                    send_cmd(driver, mid, pos, MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
+                    tgt = float(actions[idx]) if mid in active_ids else float(joint_pos[idx])
+                    kp  = MOTOR_CONFIG[mid]["kp"]
+                    kd  = MOTOR_CONFIG[mid]["kd"]
+                    if args.torque_cap > 0:
+                        cur     = float(joint_pos[idx])
+                        max_err = args.torque_cap / kp
+                        tgt     = cur + float(np.clip(tgt - cur, -max_err, max_err))
+                    send_cmd(driver, mid, tgt, kp, kd)
             elif args.dry_run:
                 # 模擬完美追蹤：讓 policy 下一步看到位置已到達目標
                 joint_pos[:] = actions
@@ -1566,6 +1572,9 @@ def main():
     parser.add_argument("--torque-limit", type=float, default=0.5,
                         help="扭矩安全上限（佔最大值比例，預設 0.5 = 50%%）；"
                              "用於 home_ramp 步長計算與 replay/check 過載判定")
+    parser.add_argument("--torque-cap", type=float, default=0.0,
+                        help="policy 模式每顆馬達最大扭力上限（Nm，0=不限制）；"
+                             "例如 --torque-cap 20 限制全部馬達輸出 ≤ 20Nm")
 
     # 錄製
     parser.add_argument("--recording", default=None,
