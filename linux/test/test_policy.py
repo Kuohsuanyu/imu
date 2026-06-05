@@ -840,12 +840,13 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
     record_secs = getattr(args, "record_secs", 0)
     rec_tgt  = {mid: [] for mid in motor_ids}   # 記錄 target positions
     rec_tau  = {mid: [] for mid in motor_ids}   # 記錄 torques
-    rec_pg   = []                                # 記錄 projected gravity
-    rec_acc  = []                                # 記錄 acc
-    rec_gyro = []                                # 記錄 gyro
+    rec_pg      = []                             # 記錄 projected gravity
+    rec_acc     = []                             # 記錄 acc
+    rec_gyro    = []                             # 記錄 gyro
+    rec_csv_rows = []                            # 記錄每幀 target（用於 replay）
 
     if record_secs > 0:
-        _info(f"記錄模式：自動跑 {record_secs}s 後輸出統計分析")
+        _info(f"記錄模式：自動跑 {record_secs}s 後輸出統計分析，並存 CSV 供 replay")
     _info("Ctrl+C 停止")
     try:
         while True:
@@ -869,7 +870,11 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
                     cap = args.torque_cap if args.torque_cap > 0 else cfg.get("torque_cap", 0.0)
                     if cap > 0:
                         cur     = float(joint_pos[idx])
-                        max_err = cap / kp
+                        vel     = float(joint_vel[idx])
+                        # kd 項也計入總扭力預算：(cap - kd*|vel|) 剩餘給 kp 項
+                        kd_tau  = kd * abs(vel)
+                        kp_budget = max(0.0, cap - kd_tau)
+                        max_err = kp_budget / kp if kp > 0 else 0.0
                         tgt     = cur + float(np.clip(tgt - cur, -max_err, max_err))
                     send_cmd(driver, mid, tgt, kp, kd)
             elif args.dry_run:
@@ -887,6 +892,15 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
                     tau    = calc_torque(tgt, cur, vel, cfg["kp"], cfg["kd"], max_t)
                     rec_tgt[mid].append(math.degrees(tgt))
                     rec_tau[mid].append(abs(tau))
+                # CSV row for replay
+                if record_secs > 0:
+                    row = {"time_s": f"{sim_t:.4f}"}
+                    for name in RECORDING_JOINT_NAMES:
+                        pol_i = POLICY_JOINT_NAMES.index(name)
+                        row[f"target_{name}"] = f"{float(actions[pol_i]):.6f}"
+                        row[f"pos_{name}"]    = f"{float(joint_pos[pol_i]):.6f}"
+                        row[f"vel_{name}"]    = "0.000000"
+                    rec_csv_rows.append(row)
                 if bridge is not None:
                     with bridge._imu_lock:
                         _acc  = bridge.IMU_STATE["acc"].copy()
@@ -980,6 +994,25 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
             print(f"\n  ── IMU 角速度範圍（rad/s）──")
             for i, ax in enumerate("XYZ"):
                 print(f"  {ax}: [{gyro_arr[:,i].min():+.3f}, {gyro_arr[:,i].max():+.3f}]  mean={gyro_arr[:,i].mean():+.3f}")
+
+    # 儲存 CSV 供 replay
+    if rec_csv_rows:
+        import datetime
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = RECORDINGS_DIR / f"{ts}_actions.csv"
+        fieldnames = ["time_s"] + [f"target_{n}" for n in RECORDING_JOINT_NAMES] \
+                                 + [f"pos_{n}"    for n in RECORDING_JOINT_NAMES] \
+                                 + [f"vel_{n}"    for n in RECORDING_JOINT_NAMES]
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(rec_csv_rows)
+        _ok(f"已儲存 {len(rec_csv_rows)} 幀到 {csv_path}")
+        print(f"\n  replay 指令（--no-policy 直接送錄製目標）：")
+        print(f"  python linux/test/test_policy.py --mode replay --no-policy "
+              f"--recording {csv_path} --ids {','.join(str(m) for m in motor_ids)} "
+              f"--left-can can1\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
