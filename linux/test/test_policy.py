@@ -97,16 +97,16 @@ _MID_CAN: dict = {}
 
 # ── CAN ID → 關節名稱、型號、PD 增益（10 腿部馬達）────────────────────────────
 MOTOR_CONFIG = {
-    31: {"name": "dof_left_hip_pitch_04",  "type": "04", "kp": 150.0, "kd": 24.722},
-    32: {"name": "dof_left_hip_roll_03",   "type": "03", "kp": 200.0, "kd": 26.387},
-    33: {"name": "dof_left_hip_yaw_03",    "type": "03", "kp": 100.0, "kd":  3.419},
-    34: {"name": "dof_left_knee_04",       "type": "04", "kp": 150.0, "kd":  8.654},
-    35: {"name": "dof_left_ankle_02",      "type": "02", "kp":  40.0, "kd":  0.990},
-    41: {"name": "dof_right_hip_pitch_04", "type": "04", "kp": 150.0, "kd": 24.722},
-    42: {"name": "dof_right_hip_roll_03",  "type": "03", "kp": 200.0, "kd": 26.387},
-    43: {"name": "dof_right_hip_yaw_03",   "type": "03", "kp": 100.0, "kd":  3.419},
-    44: {"name": "dof_right_knee_04",      "type": "04", "kp": 150.0, "kd":  8.654},
-    45: {"name": "dof_right_ankle_02",     "type": "02", "kp":  40.0, "kd":  0.990},
+    31: {"name": "dof_left_hip_pitch_04",  "type": "04", "kp": 150.0, "kd": 24.722, "torque_cap": 15.0},
+    32: {"name": "dof_left_hip_roll_03",   "type": "03", "kp": 200.0, "kd": 26.387, "torque_cap": 12.0},
+    33: {"name": "dof_left_hip_yaw_03",    "type": "03", "kp": 100.0, "kd":  3.419, "torque_cap":  8.0},
+    34: {"name": "dof_left_knee_04",       "type": "04", "kp": 150.0, "kd":  8.654, "torque_cap": 10.0},
+    35: {"name": "dof_left_ankle_02",      "type": "02", "kp":  40.0, "kd":  0.990, "torque_cap":  4.0},
+    41: {"name": "dof_right_hip_pitch_04", "type": "04", "kp": 150.0, "kd": 24.722, "torque_cap": 15.0},
+    42: {"name": "dof_right_hip_roll_03",  "type": "03", "kp": 200.0, "kd": 26.387, "torque_cap": 12.0},
+    43: {"name": "dof_right_hip_yaw_03",   "type": "03", "kp": 100.0, "kd":  3.419, "torque_cap":  8.0},
+    44: {"name": "dof_right_knee_04",      "type": "04", "kp": 150.0, "kd":  8.654, "torque_cap": 10.0},
+    45: {"name": "dof_right_ankle_02",     "type": "02", "kp":  40.0, "kd":  0.990, "torque_cap":  4.0},
 }
 ACTUATOR_TYPE_MAP = {"02": "Robstride02", "03": "Robstride03", "04": "Robstride04"}
 MAX_TORQUE = {"04": 84.0, "03": 42.0, "02": 11.9}
@@ -853,12 +853,14 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
             if not args.dry_run and driver:
                 for mid in motor_ids:
                     idx = motor_id_to_policy_idx(mid)
+                    cfg = MOTOR_CONFIG[mid]
                     tgt = float(actions[idx]) if mid in active_ids else float(joint_pos[idx])
-                    kp  = MOTOR_CONFIG[mid]["kp"]
-                    kd  = MOTOR_CONFIG[mid]["kd"]
-                    if args.torque_cap > 0:
+                    kp  = cfg["kp"]
+                    kd  = cfg["kd"]
+                    cap = args.torque_cap if args.torque_cap > 0 else cfg.get("torque_cap", 0.0)
+                    if cap > 0:
                         cur     = float(joint_pos[idx])
-                        max_err = args.torque_cap / kp
+                        max_err = cap / kp
                         tgt     = cur + float(np.clip(tgt - cur, -max_err, max_err))
                     send_cmd(driver, mid, tgt, kp, kd)
             elif args.dry_run:
