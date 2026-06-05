@@ -837,6 +837,15 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
     elif args.skip_home_ramp:
         _warn("--skip-home-ramp：跳過 Home ramp，確認機器人已在初始姿態")
 
+    record_secs = getattr(args, "record_secs", 0)
+    rec_tgt  = {mid: [] for mid in motor_ids}   # 記錄 target positions
+    rec_tau  = {mid: [] for mid in motor_ids}   # 記錄 torques
+    rec_pg   = []                                # 記錄 projected gravity
+    rec_acc  = []                                # 記錄 acc
+    rec_gyro = []                                # 記錄 gyro
+
+    if record_secs > 0:
+        _info(f"記錄模式：自動跑 {record_secs}s 後輸出統計分析")
     _info("Ctrl+C 停止")
     try:
         while True:
@@ -864,19 +873,36 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
                         tgt     = cur + float(np.clip(tgt - cur, -max_err, max_err))
                     send_cmd(driver, mid, tgt, kp, kd)
             elif args.dry_run:
-                # 模擬完美追蹤：讓 policy 下一步看到位置已到達目標
                 joint_pos[:] = actions
 
-            if step_cnt % 50 == 0:
-                overload_flags = []
-                print(f"\n[t={sim_t:6.2f}s  step={step_cnt}]")
-                # IMU 資料
+            # 記錄資料
+            if record_secs > 0 or True:
+                for mid in motor_ids:
+                    idx    = motor_id_to_policy_idx(mid)
+                    cfg    = MOTOR_CONFIG[mid]
+                    tgt    = float(actions[idx])
+                    cur    = float(joint_pos[idx])
+                    vel    = float(joint_vel[idx])
+                    max_t  = MAX_TORQUE[cfg["type"]]
+                    tau    = calc_torque(tgt, cur, vel, cfg["kp"], cfg["kd"], max_t)
+                    rec_tgt[mid].append(math.degrees(tgt))
+                    rec_tau[mid].append(abs(tau))
                 if bridge is not None:
                     with bridge._imu_lock:
                         _acc  = bridge.IMU_STATE["acc"].copy()
                         _gyro = bridge.IMU_STATE["gyro"].copy()
                         _quat = bridge.IMU_STATE["quat"].copy()
-                    _pg = bridge.proj_gravity_from_quat(*_quat)
+                    rec_acc.append(_acc.copy())
+                    rec_gyro.append(_gyro.copy())
+                    rec_pg.append(bridge.proj_gravity_from_quat(*_quat))
+
+            if step_cnt % 50 == 0:
+                overload_flags = []
+                print(f"\n[t={sim_t:6.2f}s  step={step_cnt}]")
+                if bridge is not None and rec_pg:
+                    _pg = rec_pg[-1]
+                    _acc = rec_acc[-1]
+                    _gyro = rec_gyro[-1]
                     print(f"  IMU acc=[{_acc[0]:+.3f} {_acc[1]:+.3f} {_acc[2]:+.3f}]m/s²  "
                           f"gyro=[{_gyro[0]:+.3f} {_gyro[1]:+.3f} {_gyro[2]:+.3f}]rad/s  "
                           f"pg=[{_pg[0]:+.3f} {_pg[1]:+.3f} {_pg[2]:+.3f}]")
@@ -908,8 +934,52 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
             if slp > 0:
                 time.sleep(slp)
 
+            if record_secs > 0 and sim_t >= record_secs:
+                print(f"\n[記錄完成 {record_secs}s]")
+                break
+
     except KeyboardInterrupt:
         print("\n停止")
+
+    # ── 統計分析輸出 ────────────────────────────────────────────────────────────
+    if rec_tgt[motor_ids[0]]:
+        _banner("推論統計分析")
+        print(f"\n  {'關節':<28} {'目標min':>8} {'目標max':>8} {'最大扭矩':>10} {'占比':>7}  {'超上限?':>6}")
+        print(f"  {'-'*70}")
+        for mid in motor_ids:
+            cfg    = MOTOR_CONFIG[mid]
+            name   = cfg["name"].replace("dof_", "")
+            max_t  = MAX_TORQUE[cfg["type"]]
+            cap    = args.torque_cap if args.torque_cap > 0 else cfg.get("torque_cap", 0.0)
+            tmin   = min(rec_tgt[mid])
+            tmax   = max(rec_tgt[mid])
+            pk_tau = max(rec_tau[mid])
+            pct    = pk_tau / max_t * 100
+            safe_min_d = math.degrees(SAFE_MIN.get(cfg["name"], -math.pi*2))
+            safe_max_d = math.degrees(SAFE_MAX.get(cfg["name"],  math.pi*2))
+            pos_warn = " !" if (tmin < safe_min_d or tmax > safe_max_d) else "  "
+            cap_warn = " !" if (cap > 0 and pk_tau > cap) else "  "
+            print(f"  {name:<28} {tmin:>+7.1f}° {tmax:>+7.1f}°  {pk_tau:>7.2f}Nm  {pct:>5.1f}%  {pos_warn}{cap_warn}")
+        if rec_pg:
+            pg_arr = np.array(rec_pg)
+            print(f"\n  ── IMU projected_gravity 範圍 ──")
+            print(f"  X: [{pg_arr[:,0].min():+.4f}, {pg_arr[:,0].max():+.4f}]")
+            print(f"  Y: [{pg_arr[:,1].min():+.4f}, {pg_arr[:,1].max():+.4f}]")
+            print(f"  Z: [{pg_arr[:,2].min():+.4f}, {pg_arr[:,2].max():+.4f}]")
+            pg_mean = pg_arr.mean(axis=0)
+            print(f"  平均: [{pg_mean[0]:+.4f} {pg_mean[1]:+.4f} {pg_mean[2]:+.4f}]")
+            if pg_mean[2] > 0.5:
+                _warn("pg Z 平均為正值（+1方向）；訓練時直立應為 -1。建議確認 IMU 安裝方向是否需要翻轉。")
+        if rec_acc:
+            acc_arr = np.array(rec_acc)
+            print(f"\n  ── IMU 加速度範圍（m/s²）──")
+            for i, ax in enumerate("XYZ"):
+                print(f"  {ax}: [{acc_arr[:,i].min():+.3f}, {acc_arr[:,i].max():+.3f}]  mean={acc_arr[:,i].mean():+.3f}")
+        if rec_gyro:
+            gyro_arr = np.array(rec_gyro)
+            print(f"\n  ── IMU 角速度範圍（rad/s）──")
+            for i, ax in enumerate("XYZ"):
+                print(f"  {ax}: [{gyro_arr[:,i].min():+.3f}, {gyro_arr[:,i].max():+.3f}]  mean={gyro_arr[:,i].mean():+.3f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1577,6 +1647,8 @@ def main():
     parser.add_argument("--torque-cap", type=float, default=0.0,
                         help="policy 模式每顆馬達最大扭力上限（Nm，0=不限制）；"
                              "例如 --torque-cap 20 限制全部馬達輸出 ≤ 20Nm")
+    parser.add_argument("--record-secs", type=float, default=0.0,
+                        help="policy 模式跑滿 N 秒後自動停止並輸出統計分析（0=不限制）")
 
     # 錄製
     parser.add_argument("--recording", default=None,
