@@ -315,7 +315,7 @@ def build_policy_feed(step_sess, joint_pos, joint_vel, carry, num_commands, sim_
             acc  = bridge.IMU_STATE["acc"].copy().astype(np.float32)
             gyro = bridge.IMU_STATE["gyro"].copy().astype(np.float32)
             quat = bridge.IMU_STATE["quat"].copy()
-        proj_grav = -np.array(bridge.proj_gravity_from_quat(*quat), dtype=np.float32)  # H30 NED→ENU 後符號相反，翻轉對齊訓練慣例
+        proj_grav = np.array(bridge.proj_gravity_from_quat(*quat), dtype=np.float32)
     else:
         acc       = np.array([0.0, 0.0, -9.81], dtype=np.float32)
         gyro      = np.zeros(3, dtype=np.float32)

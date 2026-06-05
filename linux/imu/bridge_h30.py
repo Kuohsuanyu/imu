@@ -74,13 +74,14 @@ def _ned_to_enu(qw, qx, qy, qz):
 def proj_gravity_from_quat(qw: float, qx: float, qy: float, qz: float):
     """從 H30 NED 四元數計算投影重力向量（body frame）。
     先轉 ENU 再做 R.T @ [0,0,-1]。
+    H30 Z 軸朝下安裝，NED→ENU 後 pg Z 符號相反，翻轉對齊訓練慣例（直立=-1）。
     """
     import numpy as np
     ew, ex, ey, ez = _ned_to_enu(qw, qx, qy, qz)
     r02 = 2 * (ex * ez - ew * ey)
     r12 = 2 * (ey * ez + ew * ex)
     r22 = ew * ew - ex * ex - ey * ey + ez * ez
-    return np.array([-r02, -r12, -r22], dtype=np.float32)
+    return np.array([r02, r12, r22], dtype=np.float32)  # 翻轉：[-r02,-r12,-r22] → [r02,r12,r22]
 
 
 # ── 工具函數 ──────────────────────────────────────────────────────────────────
