@@ -1491,8 +1491,8 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
             if driver:
                 read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
 
-            # ── E-STOP 1：速度過高 ───────────────────────────────────────────
-            if driver:
+            # ── E-STOP 1：速度過高（前 3 幀跳過，等馬達從無控切換穩定）────────
+            if driver and row_i >= 3:
                 for mid in motor_ids:
                     idx = motor_id_to_policy_idx(mid)
                     v   = abs(float(joint_vel[idx]))
