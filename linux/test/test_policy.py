@@ -97,16 +97,18 @@ _MID_CAN: dict = {}
 
 # ── CAN ID → 關節名稱、型號、PD 增益（10 腿部馬達）────────────────────────────
 MOTOR_CONFIG = {
-    31: {"name": "dof_left_hip_pitch_04",  "type": "04", "kp": 150.0, "kd": 24.722, "torque_cap": 15.0},
-    32: {"name": "dof_left_hip_roll_03",   "type": "03", "kp": 200.0, "kd": 26.387, "torque_cap": 12.0},
-    33: {"name": "dof_left_hip_yaw_03",    "type": "03", "kp": 100.0, "kd":  3.419, "torque_cap":  8.0},
-    34: {"name": "dof_left_knee_04",       "type": "04", "kp": 150.0, "kd":  8.654, "torque_cap": 10.0},
-    35: {"name": "dof_left_ankle_02",      "type": "02", "kp":  40.0, "kd":  0.990, "torque_cap":  4.0},
-    41: {"name": "dof_right_hip_pitch_04", "type": "04", "kp": 150.0, "kd": 24.722, "torque_cap": 15.0},
-    42: {"name": "dof_right_hip_roll_03",  "type": "03", "kp": 200.0, "kd": 26.387, "torque_cap": 12.0},
-    43: {"name": "dof_right_hip_yaw_03",   "type": "03", "kp": 100.0, "kd":  3.419, "torque_cap":  8.0},
-    44: {"name": "dof_right_knee_04",      "type": "04", "kp": 150.0, "kd":  8.654, "torque_cap": 10.0},
-    45: {"name": "dof_right_ankle_02",     "type": "02", "kp":  40.0, "kd":  0.990, "torque_cap":  4.0},
+    # torque_cap：初次安全測試用（Nm）。走路測試用 --torque-cap 0 移除限制
+    # 參考 MuJoCo 模擬峰值：hip_pitch~81Nm, knee~84Nm, ankle~11.9Nm
+    31: {"name": "dof_left_hip_pitch_04",  "type": "04", "kp": 150.0, "kd": 24.722, "torque_cap": 60.0},
+    32: {"name": "dof_left_hip_roll_03",   "type": "03", "kp": 200.0, "kd": 26.387, "torque_cap": 30.0},
+    33: {"name": "dof_left_hip_yaw_03",    "type": "03", "kp": 100.0, "kd":  3.419, "torque_cap": 30.0},
+    34: {"name": "dof_left_knee_04",       "type": "04", "kp": 150.0, "kd":  8.654, "torque_cap": 60.0},
+    35: {"name": "dof_left_ankle_02",      "type": "02", "kp":  40.0, "kd":  0.990, "torque_cap": 10.0},
+    41: {"name": "dof_right_hip_pitch_04", "type": "04", "kp": 150.0, "kd": 24.722, "torque_cap": 60.0},
+    42: {"name": "dof_right_hip_roll_03",  "type": "03", "kp": 200.0, "kd": 26.387, "torque_cap": 30.0},
+    43: {"name": "dof_right_hip_yaw_03",   "type": "03", "kp": 100.0, "kd":  3.419, "torque_cap": 30.0},
+    44: {"name": "dof_right_knee_04",      "type": "04", "kp": 150.0, "kd":  8.654, "torque_cap": 60.0},
+    45: {"name": "dof_right_ankle_02",     "type": "02", "kp":  40.0, "kd":  0.990, "torque_cap": 10.0},
 }
 ACTUATOR_TYPE_MAP = {"02": "Robstride02", "03": "Robstride03", "04": "Robstride04"}
 MAX_TORQUE = {"04": 84.0, "03": 42.0, "02": 11.9}
@@ -245,9 +247,32 @@ _ZEROS_DEG = {
     "dof_left_hip_roll_03":    0.0,  "dof_left_hip_yaw_03":    0.0,
     "dof_left_knee_04":       50.0,  "dof_left_ankle_02":    -30.0,
 }
-_MARGIN_DEG = 55.0
-SAFE_MIN = {n: math.radians(z - _MARGIN_DEG) for n, z in _ZEROS_DEG.items()}
-SAFE_MAX = {n: math.radians(z + _MARGIN_DEG) for n, z in _ZEROS_DEG.items()}
+# 各關節安全範圍：對齊 MJCF joint limit（不讓指令超出物理限位）
+# ankle 物理限位比 ±55° 窄（MJCF right: -13°~+72°, left: -72°~+13°），需單獨限制
+SAFE_MIN = {
+    "dof_right_hip_pitch_04": math.radians(-20.0 - 55),  # -75°
+    "dof_right_hip_roll_03":  math.radians(  0.0 - 55),  # -55°
+    "dof_right_hip_yaw_03":   math.radians(  0.0 - 55),  # -55°
+    "dof_right_knee_04":      math.radians(-50.0 - 55),  # -105°
+    "dof_right_ankle_02":     math.radians(-13.0),        # MJCF 物理下限
+    "dof_left_hip_pitch_04":  math.radians( 20.0 - 55),  # -35°
+    "dof_left_hip_roll_03":   math.radians(  0.0 - 55),  # -55°
+    "dof_left_hip_yaw_03":    math.radians(  0.0 - 55),  # -55°
+    "dof_left_knee_04":       math.radians( 50.0 - 55),  # -5°
+    "dof_left_ankle_02":      math.radians(-72.0),        # MJCF 物理下限
+}
+SAFE_MAX = {
+    "dof_right_hip_pitch_04": math.radians(-20.0 + 55),  # +35°
+    "dof_right_hip_roll_03":  math.radians(  0.0 + 55),  # +55°
+    "dof_right_hip_yaw_03":   math.radians(  0.0 + 55),  # +55°
+    "dof_right_knee_04":      math.radians(-50.0 + 55),  # +5°
+    "dof_right_ankle_02":     math.radians(+72.0),        # MJCF 物理上限
+    "dof_left_hip_pitch_04":  math.radians( 20.0 + 55),  # +75°
+    "dof_left_hip_roll_03":   math.radians(  0.0 + 55),  # +55°
+    "dof_left_hip_yaw_03":    math.radians(  0.0 + 55),  # +55°
+    "dof_left_knee_04":       math.radians( 50.0 + 55),  # +105°
+    "dof_left_ankle_02":      math.radians(+13.0),        # MJCF 物理上限
+}
 
 # policy 20-dim 的安全限制陣列（腿部有限制，手臂用極大值）
 _SAFE_MIN_ARR = np.array([
@@ -804,6 +829,29 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
     carry_init = init_sess.run(None, {})
     carry = carry_init[0] if carry_init else np.zeros(carry_size, dtype=np.float32)
 
+    # MLP frame-stack warm-up：carry_size==465 代表 15幀×31D frame buffer
+    # 以初始 ZEROS 觀測填滿 buffer，避免全零 carry 讓 policy 第一步輸出極端動作
+    if carry_size == 465:
+        _info("MLP frame-stack 偵測（carry=465）：以 ZEROS 初始觀測填滿 frame buffer")
+        # ZEROS 關節角度，依 RECORDING_JOINT_NAMES 順序（= policy 輸入順序）
+        _ZEROS_ORDER = [
+            "dof_right_hip_pitch_04", "dof_right_hip_roll_03", "dof_right_hip_yaw_03",
+            "dof_right_knee_04",      "dof_right_ankle_02",
+            "dof_left_hip_pitch_04",  "dof_left_hip_roll_03",  "dof_left_hip_yaw_03",
+            "dof_left_knee_04",       "dof_left_ankle_02",
+        ]
+        zeros_jp = np.array([math.radians(_ZEROS_DEG.get(n, 0.0)) for n in _ZEROS_ORDER],
+                            dtype=np.float32)  # 10D
+        zeros_obs = np.concatenate([
+            np.array([np.sin(0.0), np.cos(0.0)], np.float32),  # sin/cos time
+            zeros_jp,                                            # joint_angles 10D
+            np.zeros(10, np.float32),                           # joint_vel 10D
+            np.array([0.0, 0.0, -1.0], np.float32),            # proj_grav（直立）
+            np.array([0.0, 0.0,  9.81], np.float32),           # imu_acc（MuJoCo 靜止值）
+            np.zeros(3, np.float32),                            # imu_gyro
+        ])  # 31D
+        carry = np.tile(zeros_obs, 15).astype(np.float32)  # 465D
+
     id_to_idx = {mid: motor_id_to_policy_idx(mid) for mid in motor_ids}
     ctrl_dt   = 0.02
     sim_t     = 0.0
@@ -812,12 +860,13 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
     joint_pos = np.zeros(20, dtype=np.float32)
     joint_vel = np.zeros(20, dtype=np.float32)
 
-    # Dry-run：以 ZEROS 站姿初始化 joint_pos，避免策略看到離初始姿態 50° 的假輸入
+    # Dry-run：把全部 10 個腿部關節都初始化到 ZEROS（包含非 active 的右腿）
+    # 若只初始化 active motors，policy 會看到右膝=0°（應是-50°）等異常輸入 → 輸出爆炸
     if args.dry_run:
-        for mid in motor_ids:
-            name = MOTOR_CONFIG[mid]["name"]
+        for mid, cfg in MOTOR_CONFIG.items():
+            name = cfg["name"]
             if name in _ZEROS_DEG:
-                joint_pos[id_to_idx[mid]] = math.radians(_ZEROS_DEG[name])
+                joint_pos[motor_id_to_policy_idx(mid)] = math.radians(_ZEROS_DEG[name])
 
     imu_info = "真實 H30 IMU" if bridge is not None else "假 IMU（直立靜止）"
     _section(f"運行配置")
@@ -836,6 +885,51 @@ def run_policy(args, motor_ids: list, active_ids: list, driver, bridge):
         input("\n  [確認] 已到達初始姿態，按 Enter 開始 Policy 推論...")
     elif args.skip_home_ramp:
         _warn("--skip-home-ramp：跳過 Home ramp，確認機器人已在初始姿態")
+
+    # ── 第一幀緩移：計算 policy 第一步輸出，若偏差 > 3° 先緩慢移動過去 ─────────
+    # 避免 ZEROS → policy_t0 之間有 10-20° 落差導致瞬間施力
+    if driver and not args.dry_run:
+        _section("第一幀緩移（policy pre-ramp）")
+        _dummy_pos = joint_pos.copy()
+        _dummy_vel = joint_vel.copy()
+        _feed0 = build_policy_feed(step_sess, _dummy_pos, _dummy_vel, carry,
+                                   num_commands, 0.0, bridge)
+        _first_out = step_sess.run(None, _feed0)
+        _first_act = np.clip(expand_actions(_first_out[0], _dummy_pos),
+                             _SAFE_MIN_ARR, _SAFE_MAX_ARR)
+        # 計算各 active 關節的最大偏差
+        _max_dev_deg = max(
+            abs(math.degrees(float(_first_act[motor_id_to_policy_idx(m)])
+                             - joint_pos[motor_id_to_policy_idx(m)]))
+            for m in active_ids
+        )
+        if _max_dev_deg > 3.0:
+            _info(f"偵測到第一幀偏差 {_max_dev_deg:.1f}°，先緩移 2s 到 policy 第一幀位置...")
+            _pre_ramp_start = joint_pos.copy()
+            _pre_ramp_dur   = 2.0
+            _t_pre = time.time()
+            while True:
+                _t0 = time.time()
+                _alpha = min((_t0 - _t_pre) / _pre_ramp_dur, 1.0)
+                if _can_reader is not None:
+                    for mid in motor_ids:
+                        _p, _v = _can_reader.get(mid)
+                        if _p is not None:
+                            joint_pos[id_to_idx[mid]] = _p
+                            joint_vel[id_to_idx[mid]] = _v
+                for mid in active_ids:
+                    _idx  = motor_id_to_policy_idx(mid)
+                    _tgt  = _pre_ramp_start[_idx] + _alpha * (_first_act[_idx] - _pre_ramp_start[_idx])
+                    send_cmd(driver, mid, float(_tgt),
+                             MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
+                if _alpha >= 1.0:
+                    _ok("第一幀緩移完成")
+                    break
+                _slp = 0.02 - (time.time() - _t0)
+                if _slp > 0:
+                    time.sleep(_slp)
+        else:
+            _ok(f"第一幀偏差 {_max_dev_deg:.1f}° < 3°，直接開始")
 
     record_secs = getattr(args, "record_secs", 0)
     rec_tgt  = {mid: [] for mid in motor_ids}   # 記錄 target positions
@@ -1263,6 +1357,20 @@ def _latest_recording() -> Path | None:
     return csvs[-1] if csvs else None
 
 
+def _replay_estop(reason: str, motor_ids: list, driver, id_to_idx: dict,
+                  joint_pos: np.ndarray, joint_vel: np.ndarray):
+    """緊急停止：印錯誤訊息並緩移回 ZEROS。"""
+    _fail(f"緊急停止（E-STOP）: {reason}")
+    _warn("正在緩移回站姿 ZEROS，請勿拔電…")
+    if driver:
+        try:
+            home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel,
+                      torque_limit_ratio=0.1)
+        except Exception as e:
+            _warn(f"home_ramp 失敗: {e}")
+    _fail("已停止，請檢查機器人狀態後再繼續。")
+
+
 def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
     # 選擇錄製檔
     rec_path = Path(args.recording) if args.recording else _latest_recording()
@@ -1288,6 +1396,25 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
     with open(rec_path, newline="") as f:
         rows = list(csv.DictReader(f))
     _ok(f"載入 {len(rows)} 幀，時長 {float(rows[-1]['time_s']):.2f}s")
+
+    # 速度縮放：每幀重複送 n_reps 次，降低有效關節速度
+    replay_speed = max(0.1, min(1.0, getattr(args, "replay_speed", 1.0)))
+    n_reps = max(1, round(1.0 / replay_speed))
+    if n_reps > 1:
+        _info(f"速度縮放 {replay_speed:.0%}：每幀重複 {n_reps} 次（有效速度降為 {1/n_reps:.0%}）")
+
+    # 保護閾值
+    estop_vel     = getattr(args, "estop_vel",     20.0)   # rad/s
+    estop_pos_err = getattr(args, "estop_pos_err", 15.0)   # degrees
+    estop_torque  = getattr(args, "estop_torque",  0.85)   # fraction of hw_max
+    CONSEC_LIMIT  = 3                                       # 連續超扭矩幀才觸發
+
+    _section("保護機制設定")
+    use_cap = args.torque_cap > 0 or any(c.get("torque_cap", 0) > 0 for c in MOTOR_CONFIG.values())
+    _info(f"Torque cap  : {'啟用（args.torque_cap 或 MOTOR_CONFIG.torque_cap）' if use_cap else '未啟用（可加 --torque-cap <Nm>）'}")
+    _info(f"E-STOP vel  : {estop_vel:.1f} rad/s （--estop-vel）")
+    _info(f"E-STOP Δpos : {estop_pos_err:.1f} °  （--estop-pos-err，幀 5 後生效）")
+    _info(f"E-STOP τ    : {estop_torque*100:.0f}% × hw_max 連續 {CONSEC_LIMIT} 幀（--estop-torque）")
 
     # 載入 policy（--no-policy 時跳過）
     if args.no_policy:
@@ -1316,60 +1443,133 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
     errors        = []   # per-leg per-frame |policy_output - recorded_target|
     torque_ratios = []   # per-leg per-frame estimated torque ratio
     positions     = []   # per-leg per-frame commanded target position (deg)
-    oob_cnt  = 0
-    nan_cnt  = 0
-    tlimit   = args.torque_limit
+    oob_cnt       = 0
+    nan_cnt       = 0
+    tlimit        = args.torque_limit
+    consec_over   = 0    # 連續超扭矩幀計數
 
-    _section(f"重播中（{'DRY RUN' if args.dry_run else 'LIVE CAN'}）")
-    print(f"  {'幀':>5}  {'時間':>6}  {'均誤差':>7}  {'超界':>4}  {'NaN':>4}  關節(cur→tgt)概覽")
+    # 列印間隔：live 模式更密集
+    print_every = 10 if (driver and not args.dry_run) else 50
+
+    _section(f"重播中（{'DRY RUN' if args.dry_run else 'LIVE CAN'}  速度={replay_speed:.0%}）")
+    print(f"  {'幀':>5}  {'時間':>6}  {'τmax%':>7}  E-STOP 速度/位置誤差監控中")
+
+    joint_pos = np.zeros(20, dtype=np.float32)
+    joint_vel = np.zeros(20, dtype=np.float32)
 
     for row_i, row in enumerate(rows):
-        t0 = time.time()
 
-        # 從錄製讀取關節狀態
-        joint_pos = np.zeros(20, dtype=np.float32)
-        joint_vel = np.zeros(20, dtype=np.float32)
+        # 從錄製讀取關節狀態（用於 dry-run 及初始值）
         rec_targets_20 = np.zeros(20, dtype=np.float32)
         for rec_i, name in enumerate(RECORDING_JOINT_NAMES):
             pol_i = _REC_TO_POL[rec_i]
-            joint_pos[pol_i]     = float(row.get(f"pos_{name}", 0))
-            joint_vel[pol_i]     = float(row.get(f"vel_{name}", 0))
+            joint_pos[pol_i]      = float(row.get(f"pos_{name}", 0))
+            joint_vel[pol_i]      = float(row.get(f"vel_{name}", 0))
             rec_targets_20[pol_i] = float(row.get(f"target_{name}", 0))
 
-        # 如果有真實馬達，也讀取回饋（overlay 真實值）
-        if driver:
-            read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
-
+        # ── 計算本幀目標（只算一次，重複送 n_reps 次）────────────────────────
         if args.no_policy:
-            # ── CSV 直播模式：直接送錄製 target，不跑 policy ────────────────
             actions = rec_targets_20
             clipped = np.clip(actions, _SAFE_MIN_ARR, _SAFE_MAX_ARR)
         else:
-            # ── Policy 推論模式：用 v20 policy 重新計算目標 ─────────────────
             feed    = build_policy_feed(step_sess, joint_pos, joint_vel, carry,
                                         num_commands, sim_t, bridge)
             outputs = step_sess.run(None, feed)
             actions = expand_actions(outputs[0], joint_pos)
             carry   = outputs[1]
-
             if np.any(np.isnan(actions)) or np.any(np.isinf(actions)):
                 nan_cnt += 1
             clipped = np.clip(actions, _SAFE_MIN_ARR, _SAFE_MAX_ARR)
             if not np.allclose(actions, clipped, atol=1e-6):
                 oob_cnt += 1
 
-        # 比對錄製 target + 計算扭矩比
-        frame_err   = []
-        frame_tau   = []
+        # ── 重複送指令（速度縮放）────────────────────────────────────────────
+        for rep in range(n_reps):
+            t0 = time.time()
+
+            # 讀取硬體回饋（每次重複都重讀）
+            if driver:
+                read_states(driver, motor_ids, joint_pos, joint_vel, id_to_idx)
+
+            # ── E-STOP 1：速度過高 ───────────────────────────────────────────
+            if driver:
+                for mid in motor_ids:
+                    idx = motor_id_to_policy_idx(mid)
+                    v   = abs(float(joint_vel[idx]))
+                    if v > estop_vel:
+                        _replay_estop(
+                            f"Actuator {mid}（{MOTOR_CONFIG[mid]['name']}）"
+                            f" 速度 {v:.2f} rad/s > 閾值 {estop_vel} rad/s",
+                            motor_ids, driver, id_to_idx, joint_pos, joint_vel)
+                        return
+
+            # ── E-STOP 2：位置偏差過大（幀 5 後生效，讓馬達先追上 ZEROS）────
+            if driver and row_i >= 5:
+                for mid in active_ids:
+                    idx     = motor_id_to_policy_idx(mid)
+                    err_deg = abs(math.degrees(float(joint_pos[idx]))
+                                  - math.degrees(float(clipped[idx])))
+                    if err_deg > estop_pos_err:
+                        _replay_estop(
+                            f"Actuator {mid}（{MOTOR_CONFIG[mid]['name']}）"
+                            f" 位置偏差 {err_deg:.1f}° > 閾值 {estop_pos_err}°",
+                            motor_ids, driver, id_to_idx, joint_pos, joint_vel)
+                        return
+
+            # ── 送馬達（含 torque cap）───────────────────────────────────────
+            frame_torque_over = False
+            if not args.dry_run and driver:
+                for mid in motor_ids:
+                    idx = motor_id_to_policy_idx(mid)
+                    cfg = MOTOR_CONFIG[mid]
+                    pos = float(clipped[idx]) if mid in active_set else \
+                          math.radians(_ZEROS_DEG.get(cfg["name"], 0.0))
+
+                    # kd-aware torque cap（與 policy 模式相同邏輯）
+                    cap = args.torque_cap if args.torque_cap > 0 else cfg.get("torque_cap", 0.0)
+                    if cap > 0:
+                        cur      = float(joint_pos[idx])
+                        vel      = float(joint_vel[idx])
+                        kd_tau   = cfg["kd"] * abs(vel)
+                        kp_bdgt  = max(0.0, cap - kd_tau)
+                        max_err  = kp_bdgt / cfg["kp"] if cfg["kp"] > 0 else 0.0
+                        pos      = cur + float(np.clip(pos - cur, -max_err, max_err))
+
+                    # E-STOP 3 預檢：估算送出後扭矩
+                    hw_max = MAX_TORQUE[cfg["type"]]
+                    tau    = calc_torque(pos, float(joint_pos[idx]),
+                                         float(joint_vel[idx]),
+                                         cfg["kp"], cfg["kd"], hw_max)
+                    if abs(tau) / hw_max > estop_torque:
+                        frame_torque_over = True
+
+                    send_cmd(driver, mid, pos, cfg["kp"], cfg["kd"])
+
+                # 連續超扭矩幀計數
+                if frame_torque_over:
+                    consec_over += 1
+                else:
+                    consec_over = 0
+
+                if consec_over >= CONSEC_LIMIT:
+                    _replay_estop(
+                        f"連續 {CONSEC_LIMIT} 幀估算扭矩 > {estop_torque*100:.0f}% hw_max",
+                        motor_ids, driver, id_to_idx, joint_pos, joint_vel)
+                    return
+
+            slp = ctrl_dt - (time.time() - t0)
+            if slp > 0:
+                time.sleep(slp)
+
+        # ── 統計（每幀只算一次）──────────────────────────────────────────────
+        frame_err = []
+        frame_tau = []
         for rec_i, name in enumerate(RECORDING_JOINT_NAMES):
             pol_i      = _REC_TO_POL[rec_i]
-            rec_target = rec_targets_20[pol_i]
-            pol_target = float(actions[pol_i])
-            frame_err.append(abs(pol_target - rec_target))
+            frame_err.append(abs(float(actions[pol_i]) - float(rec_targets_20[pol_i])))
             mid_for_name = next((m for m, c in MOTOR_CONFIG.items() if c["name"] == name), None)
             if mid_for_name:
-                # 扭矩估算：從當前位置到目標的誤差
-                frame_tau.append(torque_ratio(pol_target, joint_pos[pol_i],
+                frame_tau.append(torque_ratio(float(actions[pol_i]), joint_pos[pol_i],
                                               joint_vel[pol_i], mid_for_name))
             else:
                 frame_tau.append(0.0)
@@ -1378,15 +1578,8 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
         positions.append([math.degrees(float(actions[_REC_TO_POL[i]]))
                           for i in range(len(RECORDING_JOINT_NAMES))])
 
-        # 送馬達
-        if not args.dry_run and driver:
-            for mid in motor_ids:
-                idx = motor_id_to_policy_idx(mid)
-                pos = float(clipped[idx]) if mid in active_set else \
-                      math.radians(_ZEROS_DEG.get(MOTOR_CONFIG[mid]["name"], 0.0))
-                send_cmd(driver, mid, pos, MOTOR_CONFIG[mid]["kp"], MOTOR_CONFIG[mid]["kd"])
-
-        if row_i % 50 == 0:
+        # ── 狀態列印 ─────────────────────────────────────────────────────────
+        if row_i % print_every == 0:
             max_tau  = max(frame_tau) if frame_tau else 0.0
             over_tag = f" [OVER {max_tau*100:.0f}%]" if max_tau > tlimit else ""
             print(f"\n  [frame {row_i:4d}/{len(rows)}  t={sim_t:6.2f}s  τmax={max_tau*100:.0f}%{over_tag}]")
@@ -1395,9 +1588,19 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
                 cfg  = MOTOR_CONFIG[mid]
                 cur  = joint_pos[idx]
                 vel  = joint_vel[idx]
-                tgt  = float(clipped[idx])
-                tau  = calc_torque(tgt, cur, vel, cfg["kp"], cfg["kd"], MAX_TORQUE[cfg["type"]])
-                pct  = abs(tau) / MAX_TORQUE[cfg["type"]] * 100
+                hw_max_disp = MAX_TORQUE[cfg["type"]]
+                # 用已套 cap 的目標計算扭矩（與實際送出一致）
+                tgt_raw = float(clipped[idx])
+                cap_disp = args.torque_cap if args.torque_cap > 0 else cfg.get("torque_cap", 0.0)
+                if cap_disp > 0:
+                    kd_tau_d  = cfg["kd"] * abs(float(vel))
+                    kp_bdgt_d = max(0.0, cap_disp - kd_tau_d)
+                    max_err_d = kp_bdgt_d / cfg["kp"] if cfg["kp"] > 0 else 0.0
+                    tgt = float(cur) + float(np.clip(tgt_raw - float(cur), -max_err_d, max_err_d))
+                else:
+                    tgt = tgt_raw
+                tau  = calc_torque(tgt, cur, vel, cfg["kp"], cfg["kd"], hw_max_disp)
+                pct  = abs(tau) / hw_max_disp * 100
                 flag = " !OVER" if pct >= tlimit * 100 else ""
                 print(f"  Actuator {mid:2d} ({_MID_CAN.get(mid,'?')}):"
                       f"  pos={cur:+7.3f}rad ({math.degrees(cur):+6.1f}°)"
@@ -1406,9 +1609,6 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
                       f"  tgt={tgt:+7.3f}rad ({math.degrees(tgt):+6.1f}°){flag}")
 
         sim_t += ctrl_dt
-        slp = ctrl_dt - (time.time() - t0)
-        if slp > 0:
-            time.sleep(slp)
 
     # ── 摘要報告 ────────────────────────────────────────────────────────────
     errors_arr = np.array(errors)   # (N_frames, 10_legs)
@@ -1459,16 +1659,17 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
     else:
         _ok(f"所有關節扭矩均在 {tlimit*100:.0f}% 限制內")
 
-    _section("policy 輸出 vs 錄製 target 偏差（deg）")
-    print(f"  {'關節':<32}  {'均值':>6}  {'最大':>6}  {'P90':>6}  狀態")
-    for i, name in enumerate(RECORDING_JOINT_NAMES):
-        col = errors_arr[:, i] * 180 / math.pi
-        status = "[OK] " if col.max() < 5.0 else "[WARN]"
-        print(f"  {name:<32}  {col.mean():6.2f}  {col.max():6.2f}  "
-              f"{np.percentile(col, 90):6.2f}  {status}")
-    overall = errors_arr.flatten() * 180 / math.pi
-    print()
-    _info(f"整體均值誤差: {overall.mean():.2f}°  最大: {overall.max():.2f}°")
+    if not args.no_policy:
+        _section("policy 輸出 vs 錄製 target 偏差（deg）")
+        print(f"  {'關節':<32}  {'均值':>6}  {'最大':>6}  {'P90':>6}  狀態")
+        for i, name in enumerate(RECORDING_JOINT_NAMES):
+            col = errors_arr[:, i] * 180 / math.pi
+            status = "[OK] " if col.max() < 5.0 else "[WARN]"
+            print(f"  {name:<32}  {col.mean():6.2f}  {col.max():6.2f}  "
+                  f"{np.percentile(col, 90):6.2f}  {status}")
+        overall = errors_arr.flatten() * 180 / math.pi
+        print()
+        _info(f"整體均值誤差: {overall.mean():.2f}°  最大: {overall.max():.2f}°")
 
     passed = nan_cnt == 0 and oob_cnt == 0
     print()
@@ -1476,6 +1677,13 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
         _ok("結果: PASS ✓")
     else:
         _warn("結果: WARN 需確認")
+
+    # ── 正常完播後回 ZEROS（馬達停在最後幀位置可能是彎膝狀態）────────────────
+    if driver and not args.dry_run:
+        print()
+        _warn("Replay 完成，馬達停在最後幀位置。自動緩移回站姿 ZEROS…")
+        home_ramp(motor_ids, driver, id_to_idx, joint_pos, joint_vel,
+                  torque_limit_ratio=0.05)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1678,8 +1886,20 @@ def main():
                         help="扭矩安全上限（佔最大值比例，預設 0.5 = 50%%）；"
                              "用於 home_ramp 步長計算與 replay/check 過載判定")
     parser.add_argument("--torque-cap", type=float, default=0.0,
-                        help="policy 模式每顆馬達最大扭力上限（Nm，0=不限制）；"
+                        help="policy/replay 模式每顆馬達最大扭力上限（Nm，0=用 MOTOR_CONFIG 預設）；"
                              "例如 --torque-cap 20 限制全部馬達輸出 ≤ 20Nm")
+    parser.add_argument("--replay-speed", type=float, default=1.0,
+                        help="replay 播放速度（0.1~1.0，預設 1.0=原速）；"
+                             "0.5 = 半速，每幀重複送 2 次，有效關節速度降一半")
+    parser.add_argument("--estop-vel", type=float, default=20.0,
+                        help="E-STOP 速度閾值（rad/s，預設 20.0）；"
+                             "任意關節速度超過此值立即停止並回 ZEROS")
+    parser.add_argument("--estop-pos-err", type=float, default=15.0,
+                        help="E-STOP 位置偏差閾值（degree，預設 15.0）；"
+                             "硬體位置與目標偏差超過此值立即停止（幀 5 後生效）")
+    parser.add_argument("--estop-torque", type=float, default=0.85,
+                        help="E-STOP 扭矩閾值（佔 hw_max 比例，預設 0.85=85%%）；"
+                             "連續 3 幀估算扭矩超過此比例立即停止")
     parser.add_argument("--record-secs", type=float, default=0.0,
                         help="policy 模式跑滿 N 秒後自動停止並輸出統計分析（0=不限制）")
 
