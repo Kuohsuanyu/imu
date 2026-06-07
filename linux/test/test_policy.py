@@ -1467,6 +1467,17 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
             joint_vel[pol_i]      = float(row.get(f"vel_{name}", 0))
             rec_targets_20[pol_i] = float(row.get(f"target_{name}", 0))
 
+        # 預讀下一幀（用於幀內插值，消除幀間跳變）
+        if row_i + 1 < len(rows):
+            next_row = rows[row_i + 1]
+            next_rec = np.zeros(20, dtype=np.float32)
+            for rec_i, name in enumerate(RECORDING_JOINT_NAMES):
+                pol_i = _REC_TO_POL[rec_i]
+                next_rec[pol_i] = float(next_row.get(f"target_{name}", 0))
+            next_clipped = np.clip(next_rec, _SAFE_MIN_ARR, _SAFE_MAX_ARR)
+        else:
+            next_clipped = None
+
         # ── 計算本幀目標（只算一次，重複送 n_reps 次）────────────────────────
         if args.no_policy:
             actions = rec_targets_20
@@ -1483,8 +1494,14 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
             if not np.allclose(actions, clipped, atol=1e-6):
                 oob_cnt += 1
 
-        # ── 重複送指令（速度縮放）────────────────────────────────────────────
+        # ── 重複送指令（速度縮放 + 幀間線性插值）────────────────────────────
         for rep in range(n_reps):
+            # 幀內插值：alpha 從 0 線性到 1，消除幀間跳變
+            if next_clipped is not None and n_reps > 1:
+                alpha = rep / n_reps
+                interp_clipped = clipped + alpha * (next_clipped - clipped)
+            else:
+                interp_clipped = clipped
             t0 = time.time()
 
             # 讀取硬體回饋（每次重複都重讀）
@@ -1522,7 +1539,7 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
                 for mid in motor_ids:
                     idx = motor_id_to_policy_idx(mid)
                     cfg = MOTOR_CONFIG[mid]
-                    pos = float(clipped[idx]) if mid in active_set else \
+                    pos = float(interp_clipped[idx]) if mid in active_set else \
                           math.radians(_ZEROS_DEG.get(cfg["name"], 0.0))
 
                     # kd-aware torque cap（與 policy 模式相同邏輯）
@@ -1589,8 +1606,8 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
                 cur  = joint_pos[idx]
                 vel  = joint_vel[idx]
                 hw_max_disp = MAX_TORQUE[cfg["type"]]
-                # 用已套 cap 的目標計算扭矩（與實際送出一致）
-                tgt_raw = float(clipped[idx])
+                # 用已套 cap + 插值的目標計算扭矩（與實際送出一致）
+                tgt_raw = float(interp_clipped[idx])
                 cap_disp = args.torque_cap if args.torque_cap > 0 else cfg.get("torque_cap", 0.0)
                 if cap_disp > 0:
                     kd_tau_d  = cfg["kd"] * abs(float(vel))
