@@ -1521,11 +1521,12 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
                         return
 
             # ── E-STOP 2：位置偏差過大（幀 5 後生效，讓馬達先追上 ZEROS）────
+            # 用插值目標（interp_clipped）比較，避免插值期間的誤報
             if driver and row_i >= 5:
                 for mid in active_ids:
                     idx     = motor_id_to_policy_idx(mid)
                     err_deg = abs(math.degrees(float(joint_pos[idx]))
-                                  - math.degrees(float(clipped[idx])))
+                                  - math.degrees(float(interp_clipped[idx])))
                     if err_deg > estop_pos_err:
                         _replay_estop(
                             f"Actuator {mid}（{MOTOR_CONFIG[mid]['name']}）"
