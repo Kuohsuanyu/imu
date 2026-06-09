@@ -39,6 +39,10 @@ _HERE       = Path(__file__).resolve().parent          # linux/test/
 _LINUX_IMU  = _HERE.parent / "imu"                    # linux/imu/
 _REPO_ROOT  = _HERE.parent.parent                     # repo 根目錄（imu/）
 
+# tools/ 模組
+sys.path.insert(0, str(_REPO_ROOT / "tools"))
+from spike_filter import SpikeFilter, JOINT_NAMES as _SF_JOINT_NAMES  # noqa: E402
+
 # 預設策略檔：優先找 repo 內 models/
 def _find_default_policy() -> Path:
     kinfers = sorted((_REPO_ROOT / "models").glob("*.kinfer"))
@@ -1457,6 +1461,15 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
     joint_pos = np.zeros(20, dtype=np.float32)
     joint_vel = np.zeros(20, dtype=np.float32)
 
+    # 即時突波過濾：單幀突波自動平滑，連續突波觸發 E-STOP
+    _spike_filter = SpikeFilter(
+        n_joints=20,
+        max_jump_deg=35.0,
+        max_consecutive=5,
+        joint_names=[MOTOR_CONFIG[mid]["name"] if mid in MOTOR_CONFIG else f"j{i}"
+                     for i, mid in enumerate(sorted(MOTOR_CONFIG))],
+    )
+
     for row_i, row in enumerate(rows):
 
         # 從錄製讀取關節狀態（用於 dry-run 及初始值）
@@ -1493,6 +1506,14 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
             clipped = np.clip(actions, _SAFE_MIN_ARR, _SAFE_MAX_ARR)
             if not np.allclose(actions, clipped, atol=1e-6):
                 oob_cnt += 1
+
+        # ── 突波過濾（單幀平滑，連續突波 E-STOP）──────────────────────────
+        clipped, spike_abort = _spike_filter.update(clipped)
+        if spike_abort:
+            _replay_estop(
+                f"突波過濾器中止：{spike_abort}",
+                motor_ids, driver, id_to_idx, joint_pos, joint_vel)
+            return
 
         # ── 重複送指令（速度縮放 + 幀間線性插值）────────────────────────────
         for rep in range(n_reps):
