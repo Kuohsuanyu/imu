@@ -741,8 +741,10 @@ RAMP_DURATION_S = 3.0   # home_ramp 固定耗時（秒），調整此值控制�
 
 def home_ramp(motor_ids: list, driver, id_to_idx: dict,
               joint_pos: np.ndarray, joint_vel: np.ndarray,
-              torque_limit_ratio: float = 0.05):
-    """從當前位置以固定時間線性插值移動到 ZEROS 初始姿態。
+              torque_limit_ratio: float = 0.05,
+              custom_targets: dict | None = None):
+    """從當前位置以固定時間線性插值移動到目標姿態。
+    custom_targets: {motor_id: rad}，若為 None 則移到 ZEROS 站姿。
     固定跑完 RAMP_DURATION_S 秒，不以誤差判斷提前結束，確保平順。
     """
     ctrl_dt = 0.02
@@ -1437,12 +1439,36 @@ def run_replay(args, motor_ids: list, active_ids: list, driver, bridge):
     ctrl_dt    = 0.02
     sim_t      = 0.0
 
-    # Home ramp：讀取當前位置，緩移到站姿後再開始播放
+    # Home ramp：先移到 ZEROS 站姿，再緩移到 CSV 第一幀位置
     if driver and not args.skip_home_ramp:
         _ramp_pos = np.zeros(20, dtype=np.float32)
         _ramp_vel = np.zeros(20, dtype=np.float32)
+        # 第一段：移到 ZEROS 站姿
         home_ramp(motor_ids, driver, id_to_idx, _ramp_pos, _ramp_vel, 0.05)
-        input("\n  [確認] 已到達站姿，按 Enter 開始 Replay...")
+        # 第二段：從站姿緩移到 CSV 第一幀（消除啟動衝擊）
+        first_row = rows[0]
+        csv_frame0 = {}
+        for mid in motor_ids:
+            col = f"target_{MOTOR_CONFIG[mid]['name']}"
+            if col in first_row:
+                csv_frame0[mid] = float(first_row[col])
+        if csv_frame0:
+            _info("銜接 Ramp：從站姿移到 CSV 起始姿態（2秒）...")
+            t_start   = time.time()
+            ramp_dur  = 2.0
+            read_states(driver, motor_ids, _ramp_pos, _ramp_vel, id_to_idx)
+            start_pos = {mid: float(_ramp_pos[id_to_idx[mid]]) for mid in motor_ids}
+            while True:
+                alpha = min((time.time() - t_start) / ramp_dur, 1.0)
+                for mid in motor_ids:
+                    if mid in csv_frame0:
+                        tgt = start_pos[mid] + alpha * (csv_frame0[mid] - start_pos[mid])
+                        cfg = MOTOR_CONFIG[mid]
+                        send_cmd(driver, mid, tgt, cfg["kp"], cfg["kd"])
+                if alpha >= 1.0:
+                    break
+                time.sleep(0.02)
+        input("\n  [確認] 已到達 CSV 起始姿態，按 Enter 開始 Replay...")
 
     errors        = []   # per-leg per-frame |policy_output - recorded_target|
     torque_ratios = []   # per-leg per-frame estimated torque ratio
